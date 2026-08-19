@@ -1,0 +1,11 @@
+{
+  "name": "DokuPDF",
+  "description": "DokuPDF - PDF Scanner & Editor with Custom Canvas Engine, OCR, Document Converter, Tools, and Signer",
+  "requestFramePermissions": [
+    "android.permission.CAMERA",
+    "android.permission.READ_EXTERNAL_STORAGE",
+    "android.permission.WRITE_EXTERNAL_STORAGE"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

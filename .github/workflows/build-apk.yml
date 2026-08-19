@@ -1,0 +1,101 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - 'debug'
+          - 'release'
+          - 'both'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK (${{ github.event.inputs.build_type || 'debug' }})
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        # Tidak pin gradle-version di sini secara sengaja: versi Gradle yang dipakai
+        # HARUS mengikuti satu sumber kebenaran, yaitu gradle/wrapper/gradle-wrapper.properties
+        # (karena build dijalankan lewat ./gradlew, bukan `gradle` langsung).
+        # Pinning versi berbeda di sini rawan menciptakan 2 sumber kebenaran yang bisa
+        # kembali bentrok seperti kasus AGP 9.1.1 vs Gradle 8.11.1 sebelumnya.
+
+      - name: Prepare Environment and Keystore
+        run: |
+          # Copy .env.example to .env if .env does not exist
+          if [ ! -f .env ]; then
+            if [ -f .env.example ]; then
+              cp .env.example .env
+            else
+              touch .env
+            fi
+          fi
+
+          # If GEMINI_API_KEY secret exists in repo, append or replace
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+          fi
+
+          # Decode debug keystore if base64 file exists, or generate fallback debug keystore
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              (base64 -d debug.keystore.base64 > debug.keystore) || (base64 -D debug.keystore.base64 > debug.keystore) || true
+            fi
+          fi
+          if [ ! -f debug.keystore ] || [ ! -s debug.keystore ]; then
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Ensure Gradle wrapper exists and is executable
+          if [ ! -f gradlew ]; then
+            gradle wrapper
+          fi
+          chmod +x gradlew
+
+      - name: Build Debug APK
+        if: ${{ github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '' }}
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Build Release APK
+        if: ${{ github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' }}
+        run: ./gradlew assembleRelease --stacktrace
+        continue-on-error: true
+
+      - name: Upload Debug APK Artifact
+        if: ${{ always() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dokupdf-app-debug
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Release APK Artifact
+        if: ${{ always() && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dokupdf-app-release
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+          if-no-files-found: ignore
