@@ -42,25 +42,37 @@ class PdfCompressor(
         val pdfDoc = PdfDocument()
 
         try {
+            require(sourcePdf.isFile && sourcePdf.length() > 0L) { "Berkas PDF sumber tidak valid" }
             val bitmaps = rendererEngine.renderPdfPages(sourcePdf, scale = level.scaleFactor)
-            for ((index, bmp) in bitmaps.withIndex()) {
-                // Compress bitmap with JPEG stream to reduce raster density
-                val stream = ByteArrayOutputStream()
-                bmp.compress(Bitmap.CompressFormat.JPEG, level.jpegQuality, stream)
-                val compressedBmpBytes = stream.toByteArray()
-                val compressedBmp = android.graphics.BitmapFactory.decodeByteArray(
-                    compressedBmpBytes, 0, compressedBmpBytes.size
-                )
+            require(bitmaps.isNotEmpty()) { "PDF tidak memiliki halaman yang dapat dikompresi" }
+            try {
+                for ((index, bmp) in bitmaps.withIndex()) {
+                    val compressedBmp = ByteArrayOutputStream().use { stream ->
+                        require(bmp.compress(Bitmap.CompressFormat.JPEG, level.jpegQuality, stream)) {
+                            "Gagal mengompresi halaman ${index + 1}"
+                        }
+                        val bytes = stream.toByteArray()
+                        requireNotNull(android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)) {
+                            "Gagal membaca ulang halaman terkompresi ${index + 1}"
+                        }
+                    }
 
-                val pageInfo = PdfDocument.PageInfo.Builder(
-                    compressedBmp.width,
-                    compressedBmp.height,
-                    index + 1
-                ).create()
+                    try {
+                        val pageInfo = PdfDocument.PageInfo.Builder(
+                            compressedBmp.width,
+                            compressedBmp.height,
+                            index + 1
+                        ).create()
 
-                val page = pdfDoc.startPage(pageInfo)
-                page.canvas.drawBitmap(compressedBmp, 0f, 0f, null)
-                pdfDoc.finishPage(page)
+                        val page = pdfDoc.startPage(pageInfo)
+                        page.canvas.drawBitmap(compressedBmp, 0f, 0f, null)
+                        pdfDoc.finishPage(page)
+                    } finally {
+                        if (!compressedBmp.isRecycled) compressedBmp.recycle()
+                    }
+                }
+            } finally {
+                bitmaps.forEach { if (!it.isRecycled) it.recycle() }
             }
 
             outputPdf.parentFile?.mkdirs()
@@ -81,6 +93,7 @@ class PdfCompressor(
                 )
             )
         } catch (e: Exception) {
+            if (outputPdf.exists() && outputPdf.length() == 0L) outputPdf.delete()
             Result.failure(e)
         } finally {
             pdfDoc.close()

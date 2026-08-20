@@ -22,6 +22,7 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -36,6 +37,9 @@ import com.example.core.crop.AutoCropDetector
 import com.example.core.filter.FilterProcessor
 import com.example.core.model.CropGeometry
 import com.example.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.hypot
 import kotlin.math.roundToInt
 
@@ -62,15 +66,62 @@ fun InteractiveCropScreen(
     onBack: () -> Unit,
     onCropConfirmed: (croppedBitmap: Bitmap, geometry: CropGeometry, rotatedBitmap: Bitmap) -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     var workingBitmap by remember { mutableStateOf(initialBitmap) }
     var cropGeometry by remember {
-        mutableStateOf(
-            initialGeometry ?: AutoCropDetector.detectDocumentCorners(initialBitmap)
-        )
+        mutableStateOf(initialGeometry ?: AutoCropDetector.defaultGeometry())
     }
+    var isProcessing by remember { mutableStateOf(initialGeometry == null) }
+    var bitmapHandedOff by remember { mutableStateOf(false) }
 
     var activeHandle by remember { mutableStateOf(HandleType.NONE) }
     var displayedImageBounds by remember { mutableStateOf(Rect.Zero) }
+
+    fun detectEdges(bitmap: Bitmap = workingBitmap) {
+        scope.launch {
+            isProcessing = true
+            try {
+                val detected = withContext(Dispatchers.Default) {
+                    AutoCropDetector.detectDocumentCorners(bitmap)
+                }
+                cropGeometry = detected
+            } finally {
+                isProcessing = false
+            }
+        }
+    }
+
+    fun rotateAndDetect(degrees: Float) {
+        scope.launch {
+            isProcessing = true
+            val source = workingBitmap
+            try {
+                val rotated = withContext(Dispatchers.Default) {
+                    val matrix = Matrix().apply { postRotate(degrees) }
+                    Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+                }
+                workingBitmap = rotated
+                if (source !== initialBitmap && source !== rotated && !source.isRecycled) source.recycle()
+                cropGeometry = withContext(Dispatchers.Default) {
+                    AutoCropDetector.detectDocumentCorners(rotated)
+                }
+            } finally {
+                isProcessing = false
+            }
+        }
+    }
+
+    LaunchedEffect(initialBitmap, initialGeometry) {
+        if (initialGeometry == null) detectEdges(initialBitmap)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (!bitmapHandedOff && workingBitmap !== initialBitmap && !workingBitmap.isRecycled) {
+                workingBitmap.recycle()
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -96,10 +147,8 @@ fun InteractiveCropScreen(
                 },
                 actions = {
                     IconButton(
-                        onClick = {
-                            // Auto detect again
-                            cropGeometry = AutoCropDetector.detectDocumentCorners(workingBitmap)
-                        },
+                        onClick = { detectEdges() },
+                        enabled = !isProcessing,
                         modifier = Modifier.testTag("crop_auto_detect_btn")
                     ) {
                         Icon(Icons.Default.AutoFixHigh, contentDescription = "Deteksi Otomatis", tint = AccentEmerald)
@@ -126,14 +175,8 @@ fun InteractiveCropScreen(
                     CropActionButton(
                         icon = Icons.Default.RotateLeft,
                         label = "Kiri",
-                        onClick = {
-                            val matrix = Matrix().apply { postRotate(-90f) }
-                            workingBitmap = Bitmap.createBitmap(
-                                workingBitmap, 0, 0,
-                                workingBitmap.width, workingBitmap.height, matrix, true
-                            )
-                            cropGeometry = AutoCropDetector.detectDocumentCorners(workingBitmap)
-                        },
+                        onClick = { rotateAndDetect(-90f) },
+                        enabled = !isProcessing,
                         testTag = "crop_rotate_left_btn"
                     )
 
@@ -141,14 +184,8 @@ fun InteractiveCropScreen(
                     CropActionButton(
                         icon = Icons.Default.RotateRight,
                         label = "Kanan",
-                        onClick = {
-                            val matrix = Matrix().apply { postRotate(90f) }
-                            workingBitmap = Bitmap.createBitmap(
-                                workingBitmap, 0, 0,
-                                workingBitmap.width, workingBitmap.height, matrix, true
-                            )
-                            cropGeometry = AutoCropDetector.detectDocumentCorners(workingBitmap)
-                        },
+                        onClick = { rotateAndDetect(90f) },
+                        enabled = !isProcessing,
                         testTag = "crop_rotate_right_btn"
                     )
 
@@ -159,15 +196,28 @@ fun InteractiveCropScreen(
                         onClick = {
                             cropGeometry = AutoCropDetector.fullGeometry()
                         },
+                        enabled = !isProcessing,
                         testTag = "crop_select_all_btn"
                     )
 
                     // Confirm & Next
                     Button(
                         onClick = {
-                            val cropped = FilterProcessor.cropPerspective(workingBitmap, cropGeometry)
-                            onCropConfirmed(cropped, cropGeometry, workingBitmap)
+                            scope.launch {
+                                isProcessing = true
+                                try {
+                                    val cropped = withContext(Dispatchers.Default) {
+                                        FilterProcessor.cropPerspective(workingBitmap, cropGeometry)
+                                    }
+                                    bitmapHandedOff = true
+                                    isProcessing = false
+                                    onCropConfirmed(cropped, cropGeometry, workingBitmap)
+                                } finally {
+                                    if (!bitmapHandedOff) isProcessing = false
+                                }
+                            }
                         },
+                        enabled = !isProcessing && isEditableGeometryValid(cropGeometry),
                         colors = ButtonDefaults.buttonColors(containerColor = SleekBluePrimary),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
@@ -207,7 +257,8 @@ fun InteractiveCropScreen(
                                 activeHandle = findNearestHandle(
                                     touchOffset,
                                     cropGeometry,
-                                    displayedImageBounds
+                                    displayedImageBounds,
+                                    48.dp.toPx()
                                 )
                             },
                             onDrag = { change, dragAmount ->
@@ -281,8 +332,14 @@ fun InteractiveCropScreen(
                 val midLeft = Offset((tl.x + bl.x) / 2f, (tl.y + bl.y) / 2f)
 
                 // 3. Draw translucent dimmed overlay outside quadrilateral
-                val fullPath = Path().apply {
+                val dimmedOutsidePath = Path().apply {
+                    fillType = PathFillType.EvenOdd
                     addRect(imgRect)
+                    moveTo(tl.x, tl.y)
+                    lineTo(tr.x, tr.y)
+                    lineTo(br.x, br.y)
+                    lineTo(bl.x, bl.y)
+                    close()
                 }
                 val quadPath = Path().apply {
                     moveTo(tl.x, tl.y)
@@ -293,16 +350,9 @@ fun InteractiveCropScreen(
                 }
 
                 drawPath(
-                    path = fullPath,
+                    path = dimmedOutsidePath,
                     color = Color.Black.copy(alpha = 0.55f)
                 )
-                // Cut out quadrilateral by re-clearing or drawing quad with blend
-                drawPath(
-                    path = quadPath,
-                    color = Color.Transparent,
-                    blendMode = androidx.compose.ui.graphics.BlendMode.Clear
-                )
-                // Redraw image under quad
                 // Draw connecting border line
                 val strokeColor = Color(0xFF06B6D4) // Vibrant Cyan
                 drawPath(
@@ -325,6 +375,22 @@ fun InteractiveCropScreen(
                 drawEdgeHandle(midRight, isHorizontal = false, activeHandle == HandleType.EDGE_RIGHT)
                 drawEdgeHandle(midBottom, isHorizontal = true, activeHandle == HandleType.EDGE_BOTTOM)
                 drawEdgeHandle(midLeft, isHorizontal = false, activeHandle == HandleType.EDGE_LEFT)
+            }
+
+            if (isProcessing) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.68f),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = AccentEmerald)
+                        Spacer(Modifier.width(10.dp))
+                        Text("Mendeteksi tepi dokumen…", color = Color.White, fontSize = 13.sp)
+                    }
+                }
             }
         }
     }
@@ -402,7 +468,12 @@ private fun toScreenCoord(norm: Offset, bounds: Rect): Offset {
     )
 }
 
-private fun findNearestHandle(touch: Offset, geometry: CropGeometry, bounds: Rect): HandleType {
+private fun findNearestHandle(
+    touch: Offset,
+    geometry: CropGeometry,
+    bounds: Rect,
+    touchRadius: Float
+): HandleType {
     val tl = toScreenCoord(geometry.topLeft, bounds)
     val tr = toScreenCoord(geometry.topRight, bounds)
     val br = toScreenCoord(geometry.bottomRight, bounds)
@@ -412,8 +483,6 @@ private fun findNearestHandle(touch: Offset, geometry: CropGeometry, bounds: Rec
     val midRight = Offset((tr.x + br.x) / 2f, (tr.y + br.y) / 2f)
     val midBottom = Offset((bl.x + br.x) / 2f, (bl.y + br.y) / 2f)
     val midLeft = Offset((tl.x + bl.x) / 2f, (tl.y + bl.y) / 2f)
-
-    val touchRadius = 42f * 3f // Generous touch target
 
     val candidates = listOf(
         Pair(HandleType.TOP_LEFT, hypot((touch.x - tl.x).toDouble(), (touch.y - tl.y).toDouble()).toFloat()),
@@ -436,7 +505,7 @@ private fun updateGeometry(
     dx: Float,
     dy: Float
 ): CropGeometry {
-    return when (handle) {
+    val candidate = when (handle) {
         HandleType.TOP_LEFT -> {
             val newX = (current.topLeft.x + dx).coerceIn(0f, current.topRight.x - 0.05f)
             val newY = (current.topLeft.y + dy).coerceIn(0f, current.bottomLeft.y - 0.05f)
@@ -491,6 +560,35 @@ private fun updateGeometry(
         }
         HandleType.NONE -> current
     }
+    return if (isEditableGeometryValid(candidate)) candidate else current
+}
+
+private fun isEditableGeometryValid(geometry: CropGeometry): Boolean {
+    val points = listOf(
+        geometry.topLeft,
+        geometry.topRight,
+        geometry.bottomRight,
+        geometry.bottomLeft
+    )
+    if (points.any { !it.x.isFinite() || !it.y.isFinite() || it.x !in 0f..1f || it.y !in 0f..1f }) {
+        return false
+    }
+
+    val crosses = points.indices.map { index ->
+        val a = points[index]
+        val b = points[(index + 1) % points.size]
+        val c = points[(index + 2) % points.size]
+        (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+    }
+    if (crosses.any { kotlin.math.abs(it) < 0.001f }) return false
+    if (!(crosses.all { it > 0f } || crosses.all { it < 0f })) return false
+
+    val area = kotlin.math.abs(points.indices.sumOf { index ->
+        val current = points[index]
+        val next = points[(index + 1) % points.size]
+        (current.x * next.y - next.x * current.y).toDouble()
+    }.toFloat()) / 2f
+    return area >= 0.01f
 }
 
 @Composable
@@ -498,18 +596,19 @@ private fun CropActionButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
     onClick: () -> Unit,
+    enabled: Boolean = true,
     testTag: String
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .clip(RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 6.dp)
             .testTag(testTag)
     ) {
-        Icon(icon, contentDescription = label, tint = Color.White, modifier = Modifier.size(22.dp))
+        Icon(icon, contentDescription = label, tint = if (enabled) Color.White else Slate500, modifier = Modifier.size(22.dp))
         Spacer(modifier = Modifier.height(2.dp))
-        Text(text = label, style = MaterialTheme.typography.labelSmall, color = Slate300)
+        Text(text = label, style = MaterialTheme.typography.labelSmall, color = if (enabled) Slate300 else Slate500)
     }
 }

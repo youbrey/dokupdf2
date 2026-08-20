@@ -13,12 +13,13 @@ import java.io.File
 /**
  * High-performance PDF reader & page renderer using Android native PdfRenderer
  */
-class PdfRendererEngine(private val context: Context) {
+class PdfRendererEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
 
     suspend fun renderPdfPages(
         file: File,
         scale: Float = 2.0f
     ): List<Bitmap> = withContext(Dispatchers.IO) {
+        require(scale.isFinite() && scale in 0.1f..4f) { "Skala render PDF tidak valid" }
         val bitmaps = mutableListOf<Bitmap>()
         var pfd: ParcelFileDescriptor? = null
         var renderer: PdfRenderer? = null
@@ -34,19 +35,20 @@ class PdfRendererEngine(private val context: Context) {
 
             for (i in 0 until pageCount) {
                 val page = renderer.openPage(i)
-                val width = (page.width * scale).toInt().coerceAtLeast(1)
-                val height = (page.height * scale).toInt().coerceAtLeast(1)
-
-                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                val canvas = Canvas(bitmap)
-                canvas.drawColor(Color.WHITE)
-
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                page.close()
-                bitmaps.add(bitmap)
+                try {
+                    val (width, height) = boundedPageSize(page.width, page.height, scale)
+                    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(bitmap)
+                    canvas.drawColor(Color.WHITE)
+                    page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    bitmaps.add(bitmap)
+                } finally {
+                    page.close()
+                }
             }
         } catch (e: Exception) {
-            e.printStackTrace()
+            bitmaps.forEach { if (!it.isRecycled) it.recycle() }
+            throw e
         } finally {
             try { renderer?.close() } catch (ignored: Exception) {}
             try { pfd?.close() } catch (ignored: Exception) {}
@@ -60,6 +62,7 @@ class PdfRendererEngine(private val context: Context) {
         pageIndex: Int,
         scale: Float = 2.0f
     ): Bitmap? = withContext(Dispatchers.IO) {
+        require(scale.isFinite() && scale in 0.1f..4f) { "Skala render PDF tidak valid" }
         var pfd: ParcelFileDescriptor? = null
         var renderer: PdfRenderer? = null
         try {
@@ -69,16 +72,16 @@ class PdfRendererEngine(private val context: Context) {
             if (pageIndex < 0 || pageIndex >= renderer.pageCount) return@withContext null
 
             val page = renderer.openPage(pageIndex)
-            val width = (page.width * scale).toInt().coerceAtLeast(1)
-            val height = (page.height * scale).toInt().coerceAtLeast(1)
-
-            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(bitmap)
-            canvas.drawColor(Color.WHITE)
-
-            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            page.close()
-            bitmap
+            try {
+                val (width, height) = boundedPageSize(page.width, page.height, scale)
+                val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val canvas = Canvas(bitmap)
+                canvas.drawColor(Color.WHITE)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                bitmap
+            } finally {
+                page.close()
+            }
         } catch (e: Exception) {
             e.printStackTrace()
             null
@@ -102,5 +105,17 @@ class PdfRendererEngine(private val context: Context) {
             try { renderer?.close() } catch (ignored: Exception) {}
             try { pfd?.close() } catch (ignored: Exception) {}
         }
+    }
+
+    private fun boundedPageSize(width: Int, height: Int, scale: Float): Pair<Int, Int> {
+        var targetWidth = (width * scale).toInt().coerceAtLeast(1)
+        var targetHeight = (height * scale).toInt().coerceAtLeast(1)
+        val longest = maxOf(targetWidth, targetHeight)
+        if (longest > 4096) {
+            val downscale = 4096f / longest
+            targetWidth = (targetWidth * downscale).toInt().coerceAtLeast(1)
+            targetHeight = (targetHeight * downscale).toInt().coerceAtLeast(1)
+        }
+        return targetWidth to targetHeight
     }
 }

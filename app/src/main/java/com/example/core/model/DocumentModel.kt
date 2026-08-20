@@ -10,6 +10,7 @@ import java.util.UUID
  * Filter presets matching CamScanner image enhancement options
  */
 enum class FilterType(val displayName: String) {
+    AUTO("Otomatis"),
     ORIGINAL("Asli"),
     LIGHTEN("Cerahkan"),
     SHARPEN("Mempertajam"),
@@ -17,7 +18,31 @@ enum class FilterType(val displayName: String) {
     NO_SHADOW("Tanpa Bayangan"),
     MAGIC_BW_HP("Hitam & Putih"),
     GRAYSCALE("Grayscale"),
+    PHOTO_ENHANCE("Foto HD"),
     INVERT("Negatif")
+}
+
+/**
+ * Fine controls applied after a filter preset. Neutral values deliberately produce no
+ * additional pass so ORIGINAL can remain lossless. Ranges are enforced by [normalized].
+ */
+data class FilterSettings(
+    val brightness: Float = 1f,
+    val contrast: Float = 1f,
+    val saturation: Float = 1f,
+    val warmth: Float = 0f,
+    val sharpness: Float = 0f
+) {
+    fun normalized() = copy(
+        brightness = brightness.coerceIn(0.65f, 1.35f),
+        contrast = contrast.coerceIn(0.65f, 1.8f),
+        saturation = saturation.coerceIn(0f, 2f),
+        warmth = warmth.coerceIn(-1f, 1f),
+        sharpness = sharpness.coerceIn(0f, 1.5f)
+    )
+
+    fun isNeutral(): Boolean =
+        brightness == 1f && contrast == 1f && saturation == 1f && warmth == 0f && sharpness == 0f
 }
 
 /**
@@ -137,6 +162,7 @@ data class PageModel(
     val processedBitmap: Bitmap? = null,
     val thumbnailBitmap: Bitmap? = null,
     val filterType: FilterType = FilterType.ORIGINAL,
+    val filterSettings: FilterSettings = FilterSettings(),
     val cropGeometry: CropGeometry = CropGeometry(),
     val rotationDegrees: Int = 0,
     val brightness: Float = 1.0f,
