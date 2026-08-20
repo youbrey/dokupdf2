@@ -65,8 +65,23 @@ Implementasi baru menyatukan kamera dan impor ke satu pipeline: decode dengan ba
 - Pencarian ulang handler/placeholder kritis: handler semua tool terdaftar; fallback tidak lagi memberi sukses palsu.
 - Test Android lokal di sandbox: belum dapat dikompilasi karena sandbox tidak menyediakan Android SDK/API 36. Workflow CI kini memasang SDK tersebut dan menjalankan `testDebugUnitTest` sebelum build.
 
+## Tindak lanjut kegagalan workflow 20 Agustus 2026
+
+Workflow manual pada merge commit `6a9043a` berhasil melewati setup Android API 36, Gradle 9.3.1, kompilasi aplikasi, dan kompilasi test. Build berhenti karena dua assertion grafis di `AutoCropAndFilterTest`. Kedua test memakai `Canvas`, `Path`, dan `ColorMatrixColorFilter`, tetapi class test belum memakai native graphics Robolectric seperti test screenshot yang sudah berhasil.
+
+Perbaikan tindak lanjut:
+
+- `AutoCropAndFilterTest` memakai `@GraphicsMode(GraphicsMode.Mode.NATIVE)` agar rasterisasi test sama dengan pipeline grafis Android.
+- Assertion auto-crop/filter menyertakan confidence, geometri, alasan fallback, dan nilai piksel untuk diagnosis yang dapat ditindaklanjuti.
+- Ditambahkan regresi untuk fallback gambar datar dan filter `ORIGINAL` netral.
+- `AutoCropResult` membawa `failureReason`; scanner dan crop interaktif menulis alasan fallback ke Logcat.
+- Detektor tidak lagi menangkap seluruh `Throwable`; hanya kegagalan operasional dan kehabisan memori yang dikonversi menjadi fallback aman.
+- Workflow mengunggah laporan HTML/XML unit test meski test gagal, hanya mengunggah APK setelah build sukses, dan tidak lagi menyamarkan kegagalan release dengan `continue-on-error`.
+- Action CI dimutakhirkan ke generasi Node.js 24 untuk menghapus peringatan deprecation runner.
+- Peringatan kompilasi utama ditangani: Locale memakai `forLanguageTag`, lifecycle owner memakai package Compose terbaru, clipboard memakai API platform, test Compose memakai rule v2, dan ikon navigasi memakai varian `AutoMirrored`.
+- Gesture zoom/pan editor kini mempertahankan titik centroid gesture dan benar-benar menerapkan scale/translation ke canvas; sebelumnya state berubah tetapi tidak pernah memengaruhi tampilan.
+- Pemanggilan paksa `System.gc()` dari callback memori yang deprecated dihapus karena tidak membebaskan bitmap milik aplikasi secara deterministik dan dapat menimbulkan jeda UI.
+
 ## Catatan kompatibilitas
 
 File hasil enkripsi baru memakai ekstensi `.dokupdf` karena ciphertext bukan PDF yang dapat dibaca viewer umum. Ini mencegah aplikasi atau pengguna mengira kontainer terenkripsi sebagai PDF standar. Fungsi dekripsi tetap mendukung kontainer lama `DOKUPDF_ENCRYPTED_V1` dan `V2`.
-
-Perubahan masih berada di working tree lokal. Belum ada commit, push, atau pull request karena tindakan Git tersebut memerlukan otorisasi terpisah.

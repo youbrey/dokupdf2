@@ -57,17 +57,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onTrimMemory(level: Int) {
-        super.onTrimMemory(level)
-        if (level >= TRIM_MEMORY_MODERATE) {
-            System.gc()
-        }
-    }
-
-    override fun onLowMemory() {
-        super.onLowMemory()
-        System.gc()
-    }
 }
 
 @Composable

@@ -16,15 +16,18 @@ import com.example.core.model.FilterType
 import com.example.core.pdf.PdfSecurity
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
+@GraphicsMode(GraphicsMode.Mode.NATIVE)
 @Config(sdk = [34])
 class AutoCropAndFilterTest {
 
@@ -42,15 +45,38 @@ class AutoCropAndFilterTest {
     }
     canvas.drawPath(document, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE })
 
-    val result = AutoCropDetector.detect(bitmap)
+    try {
+      val result = AutoCropDetector.detect(bitmap)
+      val diagnostic =
+        "reason=${result.failureReason}, confidence=${result.confidence}, geometry=${result.geometry}"
 
-    assertFalse("Detektor seharusnya tidak memakai fallback", result.usedFallback)
-    assertTrue(AutoCropDetector.isValidGeometry(result.geometry))
-    assertTrue(result.geometry.topLeft.x < 0.30f)
-    assertTrue(result.geometry.topRight.x > 0.70f)
-    assertTrue(result.geometry.bottomRight.y > 0.75f)
-    assertTrue(result.geometry.bottomLeft.y > 0.75f)
-    bitmap.recycle()
+      assertFalse("Detektor seharusnya tidak memakai fallback: $diagnostic", result.usedFallback)
+      assertTrue("Geometri deteksi tidak valid: $diagnostic", AutoCropDetector.isValidGeometry(result.geometry))
+      assertTrue("Sudut kiri atas tidak terdeteksi: $diagnostic", result.geometry.topLeft.x < 0.30f)
+      assertTrue("Sudut kanan atas tidak terdeteksi: $diagnostic", result.geometry.topRight.x > 0.70f)
+      assertTrue("Sudut kanan bawah tidak terdeteksi: $diagnostic", result.geometry.bottomRight.y > 0.75f)
+      assertTrue("Sudut kiri bawah tidak terdeteksi: $diagnostic", result.geometry.bottomLeft.y > 0.75f)
+    } finally {
+      bitmap.recycle()
+    }
+  }
+
+  @Test
+  fun `auto crop reports a deterministic fallback for a flat image`() {
+    val bitmap = Bitmap.createBitmap(480, 640, Bitmap.Config.ARGB_8888).apply {
+      eraseColor(Color.rgb(120, 120, 120))
+    }
+
+    try {
+      val result = AutoCropDetector.detect(bitmap)
+
+      assertTrue("Gambar tanpa tepi harus memakai fallback", result.usedFallback)
+      assertEquals("insufficient_edge_coverage", result.failureReason)
+      assertEquals(0f, result.confidence, 0f)
+      assertTrue(AutoCropDetector.isValidGeometry(result.geometry))
+    } finally {
+      bitmap.recycle()
+    }
   }
 
   @Test
@@ -78,16 +104,42 @@ class AutoCropAndFilterTest {
     val source = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888).apply {
       eraseColor(Color.rgb(120, 140, 160))
     }
+    val sourcePixel = source.getPixel(32, 32)
     val rendered = FilterProcessor.applyFilter(
       source,
       FilterType.ORIGINAL,
       FilterSettings(brightness = 1.2f, contrast = 1.1f, warmth = 0.5f, sharpness = 0.3f)
     )
 
-    assertTrue(rendered !== source)
-    assertFalse(rendered.getPixel(32, 32) == source.getPixel(32, 32))
-    rendered.recycle()
-    source.recycle()
+    try {
+      val renderedPixel = rendered.getPixel(32, 32)
+      val diagnostic =
+        "source=${sourcePixel.toUInt().toString(16)}, rendered=${renderedPixel.toUInt().toString(16)}"
+      assertTrue("Filter harus menghasilkan bitmap independen: $diagnostic", rendered !== source)
+      assertFalse("Penyesuaian profesional harus mengubah warna piksel: $diagnostic", renderedPixel == sourcePixel)
+      assertTrue("Brightness harus meningkatkan kanal merah: $diagnostic", Color.red(renderedPixel) > Color.red(sourcePixel))
+      assertTrue("Brightness harus meningkatkan kanal hijau: $diagnostic", Color.green(renderedPixel) > Color.green(sourcePixel))
+      assertTrue("Brightness harus meningkatkan kanal biru: $diagnostic", Color.blue(renderedPixel) > Color.blue(sourcePixel))
+    } finally {
+      if (rendered !== source) rendered.recycle()
+      source.recycle()
+    }
+  }
+
+  @Test
+  fun `neutral original filter remains lossless and allocation free`() {
+    val source = Bitmap.createBitmap(32, 32, Bitmap.Config.ARGB_8888).apply {
+      eraseColor(Color.rgb(80, 110, 140))
+    }
+
+    try {
+      val rendered = FilterProcessor.applyFilter(source, FilterType.ORIGINAL, FilterSettings())
+
+      assertTrue("ORIGINAL netral harus mengembalikan bitmap sumber", rendered === source)
+      assertEquals(source.getPixel(16, 16), rendered.getPixel(16, 16))
+    } finally {
+      source.recycle()
+    }
   }
 
   @Test

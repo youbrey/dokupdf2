@@ -13,7 +13,9 @@ import kotlin.math.sqrt
 data class AutoCropResult(
     val geometry: CropGeometry,
     val confidence: Float,
-    val usedFallback: Boolean
+    val usedFallback: Boolean,
+    /** Machine-readable reason when [usedFallback] is true; null for a successful detection. */
+    val failureReason: String? = null
 )
 
 /**
@@ -42,7 +44,7 @@ object AutoCropDetector {
 
     fun detect(bitmap: Bitmap): AutoCropResult {
         if (bitmap.isRecycled || bitmap.width < 16 || bitmap.height < 16) {
-            return fallbackResult()
+            return fallbackResult("invalid_bitmap")
         }
 
         val longestEdge = max(bitmap.width, bitmap.height).toFloat()
@@ -53,8 +55,10 @@ object AutoCropDetector {
         val analysisBitmap = try {
             if (analysisWidth == bitmap.width && analysisHeight == bitmap.height) bitmap
             else Bitmap.createScaledBitmap(bitmap, analysisWidth, analysisHeight, true)
-        } catch (_: Throwable) {
-            return fallbackResult()
+        } catch (_: OutOfMemoryError) {
+            return fallbackResult("analysis_bitmap_out_of_memory")
+        } catch (error: Exception) {
+            return fallbackResult("analysis_bitmap_${error.javaClass.simpleName}")
         }
 
         return try {
@@ -89,10 +93,10 @@ object AutoCropDetector {
                 preferOuter = false, threshold = edgeThreshold
             )
 
-            val leftLine = left ?: return fallbackResult()
-            val rightLine = right ?: return fallbackResult()
-            val topLine = top ?: return fallbackResult()
-            val bottomLine = bottom ?: return fallbackResult()
+            val leftLine = left ?: return fallbackResult("left_boundary_not_found")
+            val rightLine = right ?: return fallbackResult("right_boundary_not_found")
+            val topLine = top ?: return fallbackResult("top_boundary_not_found")
+            val bottomLine = bottom ?: return fallbackResult("bottom_boundary_not_found")
 
             val tl = intersect(leftLine, topLine, analysisWidth, analysisHeight)
             val tr = intersect(rightLine, topLine, analysisWidth, analysisHeight)
@@ -104,15 +108,19 @@ object AutoCropDetector {
                 min(leftLine.coverage, rightLine.coverage),
                 min(topLine.coverage, bottomLine.coverage)
             )
-            if (minimumCoverage < 0.055f || !isValidGeometry(geometry)) {
-                fallbackResult()
+            if (minimumCoverage < 0.055f) {
+                fallbackResult("insufficient_edge_coverage")
+            } else if (!isValidGeometry(geometry)) {
+                fallbackResult("invalid_detected_geometry")
             } else {
                 val area = polygonArea(geometry)
                 val confidence = (minimumCoverage * 1.8f + area * 0.45f).coerceIn(0f, 1f)
                 AutoCropResult(geometry, confidence, usedFallback = false)
             }
-        } catch (_: Throwable) {
-            fallbackResult()
+        } catch (_: OutOfMemoryError) {
+            fallbackResult("analysis_out_of_memory")
+        } catch (error: Exception) {
+            fallbackResult("analysis_${error.javaClass.simpleName}")
         } finally {
             if (analysisBitmap !== bitmap && !analysisBitmap.isRecycled) analysisBitmap.recycle()
         }
@@ -329,7 +337,12 @@ object AutoCropDetector {
     private fun distance(first: Offset, second: Offset): Float =
         hypot((second.x - first.x).toDouble(), (second.y - first.y).toDouble()).toFloat()
 
-    private fun fallbackResult() = AutoCropResult(defaultGeometry(), confidence = 0f, usedFallback = true)
+    private fun fallbackResult(reason: String) = AutoCropResult(
+        geometry = defaultGeometry(),
+        confidence = 0f,
+        usedFallback = true,
+        failureReason = reason
+    )
 
     fun defaultGeometry(): CropGeometry = CropGeometry(
         topLeft = Offset(0.04f, 0.04f),

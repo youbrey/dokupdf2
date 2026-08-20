@@ -2,6 +2,7 @@ package com.example.ui.screens
 
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.util.Log
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -10,6 +11,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -55,6 +57,17 @@ private enum class HandleType {
     EDGE_LEFT
 }
 
+private fun detectCropGeometry(bitmap: Bitmap, source: String): CropGeometry {
+    val detection = AutoCropDetector.detect(bitmap)
+    if (detection.usedFallback) {
+        Log.w(
+            "DokuPdfAutoCrop",
+            "$source fallback: reason=${detection.failureReason}, size=${bitmap.width}x${bitmap.height}"
+        )
+    }
+    return detection.geometry
+}
+
 /**
  * CamScanner-grade Interactive 8-Point Quadrilateral Crop & Perspective Straightening Screen.
  */
@@ -82,7 +95,7 @@ fun InteractiveCropScreen(
             isProcessing = true
             try {
                 val detected = withContext(Dispatchers.Default) {
-                    AutoCropDetector.detectDocumentCorners(bitmap)
+                    detectCropGeometry(bitmap, "Interactive crop")
                 }
                 cropGeometry = detected
             } finally {
@@ -103,7 +116,7 @@ fun InteractiveCropScreen(
                 workingBitmap = rotated
                 if (source !== initialBitmap && source !== rotated && !source.isRecycled) source.recycle()
                 cropGeometry = withContext(Dispatchers.Default) {
-                    AutoCropDetector.detectDocumentCorners(rotated)
+                    detectCropGeometry(rotated, "Interactive crop rotation")
                 }
             } finally {
                 isProcessing = false
@@ -142,7 +155,7 @@ fun InteractiveCropScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack, modifier = Modifier.testTag("crop_back_btn")) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Kembali", tint = Color.White)
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Kembali", tint = Color.White)
                     }
                 },
                 actions = {
@@ -173,7 +186,7 @@ fun InteractiveCropScreen(
                 ) {
                     // Rotate Left
                     CropActionButton(
-                        icon = Icons.Default.RotateLeft,
+                        icon = Icons.AutoMirrored.Filled.RotateLeft,
                         label = "Kiri",
                         onClick = { rotateAndDetect(-90f) },
                         enabled = !isProcessing,
@@ -182,7 +195,7 @@ fun InteractiveCropScreen(
 
                     // Rotate Right
                     CropActionButton(
-                        icon = Icons.Default.RotateRight,
+                        icon = Icons.AutoMirrored.Filled.RotateRight,
                         label = "Kanan",
                         onClick = { rotateAndDetect(90f) },
                         enabled = !isProcessing,
@@ -230,7 +243,7 @@ fun InteractiveCropScreen(
                             color = Color.White
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Icon(Icons.Default.ArrowForward, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = null, modifier = Modifier.size(18.dp))
                     }
                 }
             }
