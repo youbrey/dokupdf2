@@ -245,7 +245,10 @@ class GeminiAiService {
         purpose: String,
         details: String
     ): String {
-        val date = java.text.SimpleDateFormat("dd MMMM yyyy", java.util.Locale("id")).format(java.util.Date())
+        val date = java.text.SimpleDateFormat(
+            "dd MMMM yyyy",
+            java.util.Locale.forLanguageTag("id-ID")
+        ).format(java.util.Date())
         return """
             SURAT ${letterType.uppercase()}
             

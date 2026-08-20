@@ -43,7 +43,7 @@ class DocumentRepository(
         val files = docsDir.listFiles { f -> f.extension.equals("pdf", ignoreCase = true) }?.sortedByDescending { it.lastModified() } ?: emptyList()
         val items = mutableListOf<SavedDocumentItem>()
 
-        val sdf = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale("id"))
+        val sdf = SimpleDateFormat("dd MMM yyyy, HH:mm", Locale.forLanguageTag("id-ID"))
 
         for (file in files) {
             val size = file.length()

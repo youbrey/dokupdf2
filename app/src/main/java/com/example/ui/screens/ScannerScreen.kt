@@ -1,6 +1,8 @@
 package com.example.ui.screens
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,6 +10,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.net.Uri
+import android.util.Log
 import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -31,6 +34,7 @@ import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -44,17 +48,15 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.core.crop.AutoCropDetector
 import com.example.core.filter.FilterProcessor
 import com.example.core.model.CropGeometry
@@ -192,7 +194,9 @@ fun ScannerScreen(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
-    val clipboardManager = LocalClipboardManager.current
+    val clipboardManager = remember(context) {
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    }
 
     val repository = remember { DocumentRepository(context) }
     val converter = remember { PdfConverterEngine(context) }
@@ -927,10 +931,10 @@ fun ScannerScreen(
                 val features = listOf(
                     Triple(Icons.Default.DocumentScanner, "Pindai Dokumen", "Pindai dokumen teks, surat, atau nota."),
                     Triple(Icons.Default.CreditCard, "Kartu ID / KTP", "Gabungkan foto depan dan belakang kartu ID."),
-                    Triple(Icons.Default.MenuBook, "Buku / Majalah", "Otomatis pisahkan halaman kiri & kanan."),
+                    Triple(Icons.AutoMirrored.Filled.MenuBook, "Buku / Majalah", "Otomatis pisahkan halaman kiri & kanan."),
                     Triple(Icons.Default.AutoFixHigh, "Hapus Bayangan Cerdas", "Hilangkan bayangan jari & lipatan kertas."),
                     Triple(Icons.Default.FontDownload, "Ekstrak Teks (OCR)", "Ekstrak teks gambar ke dokumen yang dapat diedit."),
-                    Triple(Icons.Default.InsertDriveFile, "Impor Berkas PDF", "Impor dokumen PDF dan lakukan peningkatan kualitas.")
+                    Triple(Icons.AutoMirrored.Filled.InsertDriveFile, "Impor Berkas PDF", "Impor dokumen PDF dan lakukan peningkatan kualitas.")
                 )
 
                 features.forEach { (icon, title, desc) ->
@@ -1004,7 +1008,9 @@ fun ScannerScreen(
             confirmButton = {
                 Button(
                     onClick = {
-                        clipboardManager.setText(AnnotatedString(ocrDialogText))
+                        clipboardManager.setPrimaryClip(
+                            ClipData.newPlainText("DokuPDF OCR", ocrDialogText)
+                        )
                         Toast.makeText(context, "Teks disalin ke clipboard", Toast.LENGTH_SHORT).show()
                         showOcrDialog = false
                     }
@@ -1165,7 +1171,7 @@ fun MultiPageReviewScreen(
                 },
                 navigationIcon = {
                     IconButton(onClick = onBackToCamera) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Kembali ke Kamera")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Kembali ke Kamera")
                     }
                 },
                 actions = {
@@ -1176,7 +1182,7 @@ fun MultiPageReviewScreen(
                         Icon(Icons.Default.TextFields, contentDescription = "OCR Teks", tint = SleekBluePrimary)
                     }
                     IconButton(onClick = { onRotatePage(currentPageIndex, 90) }) {
-                        Icon(Icons.Default.RotateRight, contentDescription = "Putar 90°", tint = Slate700)
+                        Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Putar 90°", tint = Slate700)
                     }
                     IconButton(onClick = { onDeletePage(currentPageIndex) }) {
                         Icon(Icons.Default.DeleteOutline, contentDescription = "Hapus Halaman", tint = Color(0xFFEF4444))
@@ -1321,13 +1327,13 @@ fun MultiPageReviewScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         TextButton(onClick = { onRotatePage(currentPageIndex, -90) }) {
-                            Icon(Icons.Default.RotateLeft, contentDescription = null, modifier = Modifier.size(18.dp), tint = Slate700)
+                            Icon(Icons.AutoMirrored.Filled.RotateLeft, contentDescription = null, modifier = Modifier.size(18.dp), tint = Slate700)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Kiri", fontSize = 12.sp, color = Slate700)
                         }
 
                         TextButton(onClick = { onRotatePage(currentPageIndex, 90) }) {
-                            Icon(Icons.Default.RotateRight, contentDescription = null, modifier = Modifier.size(18.dp), tint = Slate700)
+                            Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = null, modifier = Modifier.size(18.dp), tint = Slate700)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Kanan", fontSize = 12.sp, color = Slate700)
                         }
@@ -1470,7 +1476,7 @@ fun MultiPageReviewScreen(
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Icon(
-                                            Icons.Default.CompareArrows,
+                                            Icons.AutoMirrored.Filled.CompareArrows,
                                             contentDescription = "Bandingkan",
                                             tint = Color.White,
                                             modifier = Modifier.size(16.dp)
@@ -1586,6 +1592,12 @@ private fun filterForScanMode(mode: ScanMode): FilterType = when (mode) {
 
 private fun createAutoCroppedPage(bitmap: Bitmap, mode: ScanMode): ScannedPageItem {
     val detection = AutoCropDetector.detect(bitmap)
+    if (detection.usedFallback) {
+        Log.w(
+            "DokuPdfAutoCrop",
+            "Scanner fallback: reason=${detection.failureReason}, size=${bitmap.width}x${bitmap.height}"
+        )
+    }
     return ScannedPageItem(
         originalBitmap = bitmap,
         cropGeometry = detection.geometry,
@@ -1612,7 +1624,7 @@ private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = 2600
         context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, options)
         }
-    } catch (oom: OutOfMemoryError) {
+    } catch (_: OutOfMemoryError) {
         null
     } catch (error: Exception) {
         error.printStackTrace()
@@ -1670,8 +1682,7 @@ private fun imageProxyToBitmap(imageProxy: ImageProxy, maxDimension: Int = 2600)
         } else {
             bmp
         }
-    } catch (oom: OutOfMemoryError) {
-        System.gc()
+    } catch (_: OutOfMemoryError) {
         null
     } catch (e: Exception) {
         e.printStackTrace()

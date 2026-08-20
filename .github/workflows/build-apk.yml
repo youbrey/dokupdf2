@@ -17,30 +17,34 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build APK (${{ github.event.inputs.build_type || 'debug' }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
           cache: 'gradle'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android API 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           # Bootstrap version must match gradle-wrapper.properties. It is required because
           # the repository previously omitted gradle-wrapper.jar.
@@ -81,29 +85,39 @@ jobs:
       - name: Run Unit and Robolectric Tests
         run: ./gradlew testDebugUnitTest --stacktrace
 
+      - name: Upload Unit Test Reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: dokupdf-unit-test-reports-${{ github.run_attempt }}
+          path: |
+            app/build/reports/tests/testDebugUnitTest/**
+            app/build/test-results/testDebugUnitTest/**
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: Build Debug APK
-        if: ${{ github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '' }}
+        if: ${{ success() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '') }}
         run: ./gradlew assembleDebug --stacktrace
 
-      - name: Build Release APK
-        if: ${{ github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both' }}
-        run: ./gradlew assembleRelease --stacktrace
-        continue-on-error: true
-
       - name: Upload Debug APK Artifact
-        if: ${{ always() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '') }}
-        uses: actions/upload-artifact@v4
+        if: ${{ success() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '') }}
+        uses: actions/upload-artifact@v7
         with:
           name: dokupdf-app-debug
           path: app/build/outputs/apk/debug/*.apk
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: error
+
+      - name: Build Release APK
+        if: ${{ success() && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both') }}
+        run: ./gradlew assembleRelease --stacktrace
 
       - name: Upload Release APK Artifact
-        if: ${{ always() && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both') }}
-        uses: actions/upload-artifact@v4
+        if: ${{ success() && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both') }}
+        uses: actions/upload-artifact@v7
         with:
           name: dokupdf-app-release
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: error

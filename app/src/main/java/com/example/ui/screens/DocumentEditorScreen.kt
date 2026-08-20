@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -23,11 +24,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.ai.GeminiAiService
@@ -76,10 +80,19 @@ fun DocumentEditorScreen(
     // Transformation State for Zoom & Pan Canvas
     var scale by remember { mutableStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
 
-    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
-        scale = (scale * zoomChange).coerceIn(0.5f, 3.5f)
-        offset += panChange
+    val transformState = rememberTransformableState { centroid, zoomChange, panChange, _ ->
+        val updatedScale = (scale * zoomChange).coerceIn(0.5f, 3.5f)
+        val appliedZoom = updatedScale / scale
+        val viewportCenter = Offset(viewportSize.width / 2f, viewportSize.height / 2f)
+        val pivotFromCenter = if (centroid.x.isFinite() && centroid.y.isFinite()) {
+            centroid - viewportCenter
+        } else {
+            Offset.Zero
+        }
+        offset = offset * appliedZoom + pivotFromCenter * (1f - appliedZoom) + panChange
+        scale = updatedScale
     }
 
     // Dialog & Tool States
@@ -107,7 +120,7 @@ fun DocumentEditorScreen(
                 title = documentTitle,
                 subtitle = "Hal ${activePageIndex + 1} dari ${documentState.pages.size} • Canvas Engine",
                 onNavigationClick = onBack,
-                navigationIcon = Icons.Default.ArrowBack,
+                navigationIcon = Icons.AutoMirrored.Filled.ArrowBack,
                 actions = {
                     // Undo
                     IconButton(
@@ -116,7 +129,7 @@ fun DocumentEditorScreen(
                         modifier = Modifier.testTag("editor_undo_btn")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Undo,
+                            imageVector = Icons.AutoMirrored.Filled.Undo,
                             contentDescription = "Undo",
                             tint = if (canUndo) SleekBluePrimary else Slate300
                         )
@@ -128,7 +141,7 @@ fun DocumentEditorScreen(
                         modifier = Modifier.testTag("editor_redo_btn")
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Redo,
+                            imageVector = Icons.AutoMirrored.Filled.Redo,
                             contentDescription = "Redo",
                             tint = if (canRedo) SleekBluePrimary else Slate300
                         )
@@ -245,6 +258,7 @@ fun DocumentEditorScreen(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .onSizeChanged { viewportSize = it }
                     .transformable(state = transformState)
                     .pointerInput(Unit) {
                         detectTapGestures(
@@ -260,6 +274,12 @@ fun DocumentEditorScreen(
                 Canvas(
                     modifier = Modifier
                         .size(340.dp, 480.dp)
+                        .graphicsLayer {
+                            scaleX = scale
+                            scaleY = scale
+                            translationX = offset.x
+                            translationY = offset.y
+                        }
                         .testTag("document_page_canvas")
                 ) {
                     val layoutInfo = PageLayoutInfo(
@@ -570,7 +590,7 @@ fun EditorBottomToolbar(
                 // Alignments (0: Left, 1: Center, 2: Right, 3: Justify)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     ToolbarIconToggle(
-                        icon = Icons.Default.FormatAlignLeft,
+                        icon = Icons.AutoMirrored.Filled.FormatAlignLeft,
                         isSelected = alignment == 0,
                         onClick = { onChangeAlignment(0) },
                         tag = "tool_align_left"
@@ -582,7 +602,7 @@ fun EditorBottomToolbar(
                         tag = "tool_align_center"
                     )
                     ToolbarIconToggle(
-                        icon = Icons.Default.FormatAlignRight,
+                        icon = Icons.AutoMirrored.Filled.FormatAlignRight,
                         isSelected = alignment == 2,
                         onClick = { onChangeAlignment(2) },
                         tag = "tool_align_right"
@@ -629,7 +649,7 @@ fun EditorBottomToolbar(
                     AssistChip(
                         onClick = onAddWatermark,
                         label = { Text("Tanda Air") },
-                        leadingIcon = { Icon(Icons.Default.BrandingWatermark, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.BrandingWatermark, contentDescription = null, modifier = Modifier.size(16.dp)) }
                     )
                 }
                 item {

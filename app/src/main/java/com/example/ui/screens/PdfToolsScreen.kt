@@ -19,6 +19,8 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.*
+import androidx.compose.material.icons.automirrored.outlined.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
@@ -276,7 +278,7 @@ fun PdfToolsScreen(
                 id = "merge_pdf",
                 title = "Gabungkan PDF",
                 description = "Gabungkan 2 atau lebih berkas PDF menjadi satu dokumen",
-                icon = Icons.Outlined.CallMerge,
+                icon = Icons.AutoMirrored.Outlined.CallMerge,
                 iconColor = SleekBluePrimary,
                 bgColor = SleekBlueLight,
                 category = "Organisir"
@@ -285,7 +287,7 @@ fun PdfToolsScreen(
                 id = "split_pdf",
                 title = "Pisahkan PDF",
                 description = "Bagi halaman PDF per halaman atau bagian terpisah",
-                icon = Icons.Outlined.CallSplit,
+                icon = Icons.AutoMirrored.Outlined.CallSplit,
                 iconColor = AccentIndigo,
                 bgColor = AccentIndigoBg,
                 category = "Organisir"
@@ -294,7 +296,7 @@ fun PdfToolsScreen(
                 id = "rotate_pdf",
                 title = "Putar PDF",
                 description = "Putar orientasi halaman PDF 90°, 180°, atau 270°",
-                icon = Icons.Outlined.RotateRight,
+                icon = Icons.AutoMirrored.Outlined.RotateRight,
                 iconColor = SleekBluePrimary,
                 bgColor = SleekBlueLight,
                 category = "Organisir"
@@ -448,7 +450,7 @@ fun PdfToolsScreen(
                 title = "Pusat Alat PDF & AI",
                 subtitle = "18+ Alat pengolah dokumen profesional & nyata",
                 onNavigationClick = onBack,
-                navigationIcon = Icons.Default.ArrowBack
+                navigationIcon = Icons.AutoMirrored.Filled.ArrowBack
             )
         },
         containerColor = SleekBg
