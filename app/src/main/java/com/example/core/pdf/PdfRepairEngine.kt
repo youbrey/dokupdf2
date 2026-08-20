@@ -24,7 +24,9 @@ class PdfRepairEngine(
         outputPdf: File
     ): Result<RepairReport> = withContext(Dispatchers.IO) {
         val fixedIssues = mutableListOf<String>()
+        var tempFile: File? = null
         try {
+            require(sourcePdf.isFile && sourcePdf.length() > 0L) { "Berkas PDF sumber tidak valid" }
             val bytes = FileInputStream(sourcePdf).use { it.readBytes() }
             var rawText = String(bytes, Charsets.ISO_8859_1)
 
@@ -47,18 +49,27 @@ class PdfRepairEngine(
             }
 
             // 3. Re-rasterize pages through clean rendering pipeline to remove corrupt bytecode streams
-            val tempFile = File(context.cacheDir, "repair_temp_${System.currentTimeMillis()}.pdf")
-            FileOutputStream(tempFile).use { it.write(rawText.toByteArray(Charsets.ISO_8859_1)) }
+            val candidateFile = File(context.cacheDir, "repair_temp_${System.currentTimeMillis()}.pdf")
+            tempFile = candidateFile
+            FileOutputStream(candidateFile).use { it.write(rawText.toByteArray(Charsets.ISO_8859_1)) }
 
-            val pageBitmaps = try {
-                rendererEngine.renderPdfPages(tempFile, scale = 2.0f)
-            } catch (e: Exception) {
-                // Fallback to original
+            val repairedCandidatePages = try {
+                rendererEngine.renderPdfPages(candidateFile, scale = 2.0f)
+            } catch (_: Exception) {
+                emptyList()
+            }
+            val pageBitmaps = if (repairedCandidatePages.isNotEmpty()) {
+                repairedCandidatePages
+            } else {
                 rendererEngine.renderPdfPages(sourcePdf, scale = 2.0f)
             }
 
-            if (pageBitmaps.isNotEmpty()) {
-                val cleanDoc = PdfDocument()
+            require(pageBitmaps.isNotEmpty()) {
+                "Tidak ada halaman PDF yang dapat dirender; perbaikan dihentikan agar tidak menghasilkan berkas rusak palsu"
+            }
+
+            val cleanDoc = PdfDocument()
+            try {
                 for ((idx, bmp) in pageBitmaps.withIndex()) {
                     val pInfo = PdfDocument.PageInfo.Builder(bmp.width, bmp.height, idx + 1).create()
                     val page = cleanDoc.startPage(pInfo)
@@ -70,15 +81,13 @@ class PdfRepairEngine(
                 FileOutputStream(outputPdf).use { out ->
                     cleanDoc.writeTo(out)
                 }
-                cleanDoc.close()
                 fixedIssues.add("Membangun ulang struktur internal tabel xref & object dictionary (${pageBitmaps.size} halaman)")
-            } else {
-                // Direct stream write
-                FileOutputStream(outputPdf).use { it.write(rawText.toByteArray(Charsets.ISO_8859_1)) }
-                fixedIssues.add("Sanitasi byte stream struktur PDF")
+            } finally {
+                cleanDoc.close()
+                pageBitmaps.forEach { bitmap ->
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                }
             }
-
-            tempFile.delete()
 
             Result.success(
                 RepairReport(
@@ -88,7 +97,10 @@ class PdfRepairEngine(
                 )
             )
         } catch (e: Exception) {
+            if (outputPdf.exists() && outputPdf.length() == 0L) outputPdf.delete()
             Result.failure(e)
+        } finally {
+            tempFile?.delete()
         }
     }
 }

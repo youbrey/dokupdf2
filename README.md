@@ -1,6 +1,6 @@
 # DokuPDF 📄✨
 
-**DokuPDF** adalah aplikasi pengolah, pemindai, dan pengedit dokumen PDF modern untuk Android dengan arsitektur **Custom Canvas Rendering Engine**, integrasi Google ML Kit On-Device OCR, konverter dokumen Microsoft Office OpenXML (DOCX & XLSX), serta kecerdasan buatan Gemini AI.
+**DokuPDF** adalah aplikasi pemindai, pengolah, dan pengedit dokumen Android berbasis Jetpack Compose. Aplikasi memakai CameraX, OCR Google ML Kit di perangkat, ekspor DOCX OpenXML/CSV, dan fitur daring Gemini yang aktif ketika API key tersedia.
 
 ---
 
@@ -10,15 +10,16 @@
   - Rendering multi-halaman berbasis Jetpack Compose Canvas tanpa ketergantungan pada `EditText` atau `TextView`.
   - Manipulasi dokumen berbasis *Command Pattern* dengan multi-level **Undo & Redo**.
   - Dukungan navigasi dokumen: Pan, Pinch Zoom (Matrix Transformation), dan Virtualized Multi-page layout.
-- 📷 **CamScanner CameraX Document Scanner**:
-  - Deteksi dokumen otomatis dengan filter cerdas (*Asli, Tanpa Bayangan, H&P High-Contrast B&W, Hemat Tinta, Grayscale, Invert*).
-  - Crop perspektif 4 titik interaktif dengan kaca pembesar sudut (*Magnifying Lens*).
+- 📷 **CameraX Document Scanner**:
+  - Deteksi tepi dokumen otomatis dengan fallback aman dan koreksi perspektif.
+  - Preset *Otomatis, Warna Ajaib, Tanpa Bayangan, H&P, Foto HD, Grayscale,* dan kontrol manual kecerahan, kontras, saturasi, temperatur, serta ketajaman.
+  - Crop perspektif interaktif dengan 4 sudut dan 4 pegangan sisi.
   - Mode pemindaian tunggal (*Single*), banyak halaman (*Batch*), dan kartu identitas (*ID Card*).
 - 🧰 **Pusat Alat PDF Terlengkap**:
   - **Organisasi**: Gabungkan PDF, Pisahkan PDF, Rotasi Halaman (90°, 180°, 270°), Urutkan & Hapus Halaman.
-  - **Keamanan**: Kunci Sandi & Buka Proteksi PDF dengan enkripsi standar industri **AES-256 CBC** + random IV.
+  - **Keamanan**: Kontainer `.dokupdf` dengan PBKDF2-HMAC-SHA256 dan enkripsi terautentikasi **AES-256-GCM**; format lama V1/V2 tetap dapat didekripsi.
   - **Optimasi**: Kompresi ukuran berkas PDF dengan indikator penghematan ruang penyimpanan.
-  - **Perbaikan**: Engine pemulihan PDF korup via rekonstruksi tabel XRef dan stream analyzer.
+  - **Perbaikan**: Validasi dan pembangunan ulang PDF melalui rasterisasi halaman; proses gagal aman bila tidak ada halaman yang dapat dipulihkan.
   - **Bandingkan Dokumen**: Analisis perbedaan visual antar dua berkas PDF (Pixel heatmap difference).
 - 🔄 **Konversi Format Lengkap**:
   - PDF ke Word (`.docx` OpenXML native) & Word ke PDF.
@@ -53,7 +54,7 @@ Jetpack Compose Canvas
 
 - **Android Studio**: Android Studio Ladybug | 2024.2.1 atau lebih baru
 - **JDK**: Java 17 atau 21
-- **Min SDK**: API 26 (Android 8.0)
+- **Min SDK**: API 24 (Android 7.0)
 - **Target SDK**: API 36 (Android 15+)
 
 ### Cara Build via Terminal / GitHub Codespaces

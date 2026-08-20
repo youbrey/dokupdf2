@@ -319,8 +319,8 @@ fun PdfToolsScreen(
             ),
             ToolDefinition(
                 id = "lock_pdf",
-                title = "Kunci PDF",
-                description = "Enkripsi berkas PDF dengan kata sandi AES-256 aman",
+                title = "Enkripsi Dokumen",
+                description = "Buat kontainer .dokupdf terenkripsi AES-256-GCM",
                 icon = Icons.Outlined.Lock,
                 iconColor = Color(0xFFDC2626),
                 bgColor = Color(0xFFFEE2E2),
@@ -328,8 +328,8 @@ fun PdfToolsScreen(
             ),
             ToolDefinition(
                 id = "unlock_pdf",
-                title = "Buka Kunci PDF",
-                description = "Buka proteksi berkas PDF terenkripsi dengan kata sandi",
+                title = "Dekripsi Dokumen",
+                description = "Pulihkan kontainer .dokupdf menjadi PDF",
                 icon = Icons.Outlined.LockOpen,
                 iconColor = AccentEmerald,
                 bgColor = AccentEmeraldBg,
@@ -686,7 +686,7 @@ fun PdfToolsScreen(
                             "lock_pdf", "unlock_pdf" -> {
                                 item {
                                     DocumentSelector(
-                                        label = "Pilih Dokumen PDF:",
+                                        label = if (tool.id == "unlock_pdf") "Pilih kontainer .dokupdf:" else "Pilih Dokumen PDF:",
                                         pdfDocs = inAppPdfDocs,
                                         customFile = customPrimaryPdfFile,
                                         selectedIndex = selectedPdfIndex,
@@ -694,7 +694,9 @@ fun PdfToolsScreen(
                                             selectedPdfIndex = it
                                             customPrimaryPdfFile = null
                                         },
-                                        onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
+                                        onPickFromDevice = {
+                                            singlePdfPicker.launch(if (tool.id == "unlock_pdf") "*/*" else "application/pdf")
+                                        },
                                         onClearCustomFile = { customPrimaryPdfFile = null }
                                     )
                                 }
@@ -952,10 +954,10 @@ fun PdfToolsScreen(
                                                 if (passwordInput.isBlank()) {
                                                     resultMessage = "Kata sandi tidak boleh kosong!"
                                                 } else {
-                                                    val outFile = File(exportDir, "Terkunci_${targetPdf.name}")
+                                                    val outFile = File(exportDir, "Terkunci_${targetPdf.nameWithoutExtension}.dokupdf")
                                                     val res = pdfSecurity.lockPdf(targetPdf, outFile, passwordInput)
                                                     if (res.isSuccess) {
-                                                        resultMessage = "Dokumen berhasil dienkripsi (AES-256) dengan kata sandi:\n${outFile.name}"
+                                                        resultMessage = "Dokumen berhasil diamankan dengan AES-256-GCM dan PBKDF2:\n${outFile.name}\n\nCatatan: ini kontainer DokuPDF terenkripsi, bukan PDF yang dapat dibuka langsung."
                                                     } else {
                                                         resultMessage = "Gagal mengunci PDF: ${res.exceptionOrNull()?.message}"
                                                     }
@@ -969,7 +971,7 @@ fun PdfToolsScreen(
                                                 if (passwordInput.isBlank()) {
                                                     resultMessage = "Masukkan kata sandi pembuka kunci!"
                                                 } else {
-                                                    val outFile = File(exportDir, "Terbuka_${targetPdf.name}")
+                                                    val outFile = File(exportDir, "Terbuka_${targetPdf.nameWithoutExtension}.pdf")
                                                     val res = pdfSecurity.unlockPdf(targetPdf, outFile, passwordInput)
                                                     if (res.isSuccess) {
                                                         resultMessage = "Kunci dokumen berhasil dibuka & didekripsi:\n${outFile.name}"
@@ -1140,7 +1142,7 @@ fun PdfToolsScreen(
                                             }
                                         }
                                         else -> {
-                                            resultMessage = "Operasi '${tool.title}' selesai dieksekusi."
+                                            resultMessage = "Alat '${tool.title}' belum memiliki handler implementasi. Tidak ada berkas yang diubah."
                                         }
                                     }
                                 } catch (e: Exception) {

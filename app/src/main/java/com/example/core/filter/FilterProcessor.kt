@@ -2,10 +2,14 @@ package com.example.core.filter
 
 import android.graphics.*
 import androidx.compose.ui.geometry.Offset
+import com.example.core.crop.AutoCropDetector
 import com.example.core.model.CropGeometry
+import com.example.core.model.FilterSettings
 import com.example.core.model.FilterType
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * High-performance, professional document scanning filter engine.
@@ -19,19 +23,63 @@ object FilterProcessor {
         filterType: FilterType,
         brightness: Float = 1.0f,
         contrast: Float = 1.0f
-    ): Bitmap {
-        return when (filterType) {
-            FilterType.ORIGINAL -> {
-                if (brightness == 1.0f && contrast == 1.0f) source
-                else applyColorMatrix(source, brightness, contrast, 1.0f)
-            }
-            FilterType.LIGHTEN -> applyLighten(source, brightness, contrast)
-            FilterType.SHARPEN -> applySuperSharpen(source, brightness, contrast)
-            FilterType.MAGIC_COLOR -> applyMagicColor(source, brightness, contrast)
-            FilterType.NO_SHADOW -> applyNoShadow(source, brightness, contrast)
-            FilterType.MAGIC_BW_HP -> applyHighContrastBW(source, brightness, contrast)
-            FilterType.GRAYSCALE -> applyGrayscale(source, brightness, contrast)
+    ): Bitmap = applyFilter(
+        source,
+        filterType,
+        FilterSettings(brightness = brightness, contrast = contrast)
+    )
+
+    fun applyFilter(source: Bitmap, filterType: FilterType, settings: FilterSettings): Bitmap {
+        require(!source.isRecycled) { "Bitmap sumber sudah di-recycle" }
+        val preset = when (filterType) {
+            FilterType.AUTO -> applyAutoEnhance(source)
+            FilterType.ORIGINAL -> source
+            FilterType.LIGHTEN -> applyLighten(source, 1f, 1f)
+            FilterType.SHARPEN -> applySuperSharpen(source, 1f, 1f)
+            FilterType.MAGIC_COLOR -> applyMagicColor(source, 1f, 1f)
+            FilterType.NO_SHADOW -> applyNoShadow(source, 1f, 1f)
+            FilterType.MAGIC_BW_HP -> applyHighContrastBW(source, 1f, 1f)
+            FilterType.GRAYSCALE -> applyGrayscale(source, 1f, 1f)
+            FilterType.PHOTO_ENHANCE -> applyPhotoEnhance(source)
             FilterType.INVERT -> applyInvert(source)
+        }
+
+        val normalized = settings.normalized()
+        if (normalized.isNeutral()) return preset
+
+        val adjusted = applyProfessionalAdjustments(preset, normalized)
+        if (preset !== source && preset !== adjusted && !preset.isRecycled) preset.recycle()
+        return adjusted
+    }
+
+    private fun applyAutoEnhance(source: Bitmap): Bitmap {
+        val sampleStep = max(1, max(source.width, source.height) / 320)
+        var lumaSum = 0.0
+        var lumaSquareSum = 0.0
+        var chromaSum = 0.0
+        var samples = 0
+        for (y in 0 until source.height step sampleStep) {
+            for (x in 0 until source.width step sampleStep) {
+                val color = source.getPixel(x, y)
+                val red = Color.red(color)
+                val green = Color.green(color)
+                val blue = Color.blue(color)
+                val luma = (299 * red + 587 * green + 114 * blue) / 1000.0
+                lumaSum += luma
+                lumaSquareSum += luma * luma
+                chromaSum += max(red, max(green, blue)) - min(red, min(green, blue))
+                samples++
+            }
+        }
+        if (samples == 0) return source.copy(Bitmap.Config.ARGB_8888, false)
+
+        val mean = lumaSum / samples
+        val standardDeviation = kotlin.math.sqrt((lumaSquareSum / samples - mean * mean).coerceAtLeast(0.0))
+        val averageChroma = chromaSum / samples
+        return when {
+            averageChroma >= 16.0 -> applyMagicColor(source, 1f, 1f)
+            standardDeviation < 38.0 || mean < 145.0 -> applyNoShadow(source, 1.05f, 1.08f)
+            else -> applySuperSharpen(source, 1f, 0.92f)
         }
     }
 
@@ -268,14 +316,12 @@ object FilterProcessor {
         val pixels = IntArray(width * height)
         source.getPixels(pixels, 0, width, 0, 0, width, height)
 
-        val bgGrid = buildBackgroundGrid(pixels, width, height)
+        val thresholdGrid = buildAdaptiveThresholdGrid(pixels, width, height, brightness, contrast)
         val outPixels = IntArray(width * height)
-        val gridCols = bgGrid[0].size
-        val gridRows = bgGrid.size
+        val gridCols = thresholdGrid[0].size
+        val gridRows = thresholdGrid.size
         val cellW = width.toFloat() / (gridCols - 1).coerceAtLeast(1)
         val cellH = height.toFloat() / (gridRows - 1).coerceAtLeast(1)
-
-        val thresholdFactor = (0.76f * (1.0f + (brightness - 1.0f) * 0.2f)).coerceIn(0.5f, 0.92f)
 
         for (y in 0 until height) {
             val gy = (y / cellH).toInt().coerceIn(0, gridRows - 2)
@@ -286,9 +332,9 @@ object FilterProcessor {
                 val gx = (x / cellW).toInt().coerceIn(0, gridCols - 2)
                 val tx = (x - gx * cellW) / cellW
 
-                val topBg = (1f - tx) * bgGrid[gy][gx] + tx * bgGrid[gy][gx + 1]
-                val bottomBg = (1f - tx) * bgGrid[gy + 1][gx] + tx * bgGrid[gy + 1][gx + 1]
-                val bg = ((1f - ty) * topBg + ty * bottomBg).coerceIn(45f, 255f)
+                val topThreshold = (1f - tx) * thresholdGrid[gy][gx] + tx * thresholdGrid[gy][gx + 1]
+                val bottomThreshold = (1f - tx) * thresholdGrid[gy + 1][gx] + tx * thresholdGrid[gy + 1][gx + 1]
+                val localThreshold = ((1f - ty) * topThreshold + ty * bottomThreshold).coerceIn(25f, 245f)
 
                 val pixel = pixels[rowOffset + x]
                 val r = (pixel shr 16) and 0xFF
@@ -296,14 +342,12 @@ object FilterProcessor {
                 val b = pixel and 0xFF
                 val lum = (299 * r + 587 * g + 114 * b + 500) / 1000
 
-                val localThreshold = bg * thresholdFactor
-
                 if (lum >= localThreshold) {
                     outPixels[rowOffset + x] = 0xFFFFFFFF.toInt()
                 } else {
-                    // Smooth 1-pixel antialiasing near threshold edge
+                    // Preserve a narrow antialiasing band instead of producing jagged glyphs.
                     val diff = localThreshold - lum
-                    val edgeVal = if (diff < 15f) ((1f - diff / 15f) * 120f).toInt().coerceIn(0, 255) else 0
+                    val edgeVal = if (diff < 18f) ((1f - diff / 18f) * 132f).toInt().coerceIn(0, 255) else 0
                     outPixels[rowOffset + x] = (0xFF shl 24) or (edgeVal shl 16) or (edgeVal shl 8) or edgeVal
                 }
             }
@@ -312,6 +356,64 @@ object FilterProcessor {
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         output.setPixels(outPixels, 0, width, 0, 0, width, height)
         return output
+    }
+
+    /**
+     * Low-memory Sauvola threshold surface. Statistics are calculated per local block and
+     * interpolated, avoiding the 100MB+ integral-image allocations caused by full-resolution
+     * camera photos while still adapting to shadows and paper folds.
+     */
+    private fun buildAdaptiveThresholdGrid(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        brightness: Float,
+        contrast: Float
+    ): Array<FloatArray> {
+        val cols = (width / 48).coerceIn(10, 42)
+        val rows = (height / 48).coerceIn(10, 42)
+        val grid = Array(rows) { FloatArray(cols) }
+        val blockWidth = max(1, width / cols)
+        val blockHeight = max(1, height / rows)
+        val sauvolaK = (0.22f * contrast.coerceIn(0.7f, 1.6f)).coerceIn(0.14f, 0.34f)
+        val brightnessShift = (brightness.coerceIn(0.7f, 1.3f) - 1f) * 38f
+
+        for (row in 0 until rows) {
+            val centerY = ((row + 0.5f) * height / rows).toInt().coerceIn(0, height - 1)
+            val startY = (centerY - blockHeight).coerceAtLeast(0)
+            val endY = (centerY + blockHeight).coerceAtMost(height)
+            for (column in 0 until cols) {
+                val centerX = ((column + 0.5f) * width / cols).toInt().coerceIn(0, width - 1)
+                val startX = (centerX - blockWidth).coerceAtLeast(0)
+                val endX = (centerX + blockWidth).coerceAtMost(width)
+                val stepX = max(1, (endX - startX) / 18)
+                val stepY = max(1, (endY - startY) / 18)
+                var sum = 0.0
+                var squareSum = 0.0
+                var count = 0
+
+                for (y in startY until endY step stepY) {
+                    val rowOffset = y * width
+                    for (x in startX until endX step stepX) {
+                        val pixel = pixels[rowOffset + x]
+                        val red = (pixel shr 16) and 0xFF
+                        val green = (pixel shr 8) and 0xFF
+                        val blue = pixel and 0xFF
+                        val luma = (299 * red + 587 * green + 114 * blue) / 1000.0
+                        sum += luma
+                        squareSum += luma * luma
+                        count++
+                    }
+                }
+
+                val mean = if (count > 0) sum / count else 200.0
+                val deviation = kotlin.math.sqrt((squareSum / max(1, count) - mean * mean).coerceAtLeast(0.0))
+                grid[row][column] = (
+                    mean * (1.0 + sauvolaK * (deviation / 128.0 - 1.0)) - brightnessShift
+                    ).toFloat().coerceIn(25f, 245f)
+            }
+        }
+        return blurGrid(grid)
     }
 
     /**
@@ -326,6 +428,16 @@ object FilterProcessor {
      */
     private fun applyGrayscale(source: Bitmap, brightness: Float, contrast: Float): Bitmap {
         return applyColorMatrix(source, brightness * 1.05f, contrast * 1.35f, 0.0f)
+    }
+
+    /** Photo-safe enhancement that does not force paper pixels to white. */
+    private fun applyPhotoEnhance(source: Bitmap): Bitmap {
+        val output = applyColorMatrix(source, brightness = 1.03f, contrast = 1.10f, saturation = 1.12f)
+        val pixels = IntArray(output.width * output.height)
+        output.getPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+        applyUnsharpSharpen(pixels, output.width, output.height, strength = 0.28f)
+        output.setPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+        return output
     }
 
     /**
@@ -355,7 +467,8 @@ object FilterProcessor {
         source: Bitmap,
         brightness: Float,
         contrast: Float,
-        saturation: Float
+        saturation: Float,
+        warmth: Float = 0f
     ): Bitmap {
         val width = source.width
         val height = source.height
@@ -366,11 +479,12 @@ object FilterProcessor {
         val scale = contrast
         val translate = (-0.5f * scale + 0.5f + (brightness - 1.0f)) * 255f
 
+        val warmthShift = warmth.coerceIn(-1f, 1f) * 22f
         val cm = ColorMatrix(
             floatArrayOf(
-                scale, 0f, 0f, 0f, translate,
+                scale, 0f, 0f, 0f, translate + warmthShift,
                 0f, scale, 0f, 0f, translate,
-                0f, 0f, scale, 0f, translate,
+                0f, 0f, scale, 0f, translate - warmthShift,
                 0f, 0f, 0f, 1f, 0f
             )
         )
@@ -382,6 +496,28 @@ object FilterProcessor {
         paint.colorFilter = ColorMatrixColorFilter(cm)
         canvas.drawBitmap(source, 0f, 0f, paint)
 
+        return output
+    }
+
+    private fun applyProfessionalAdjustments(source: Bitmap, settings: FilterSettings): Bitmap {
+        val output = applyColorMatrix(
+            source = source,
+            brightness = settings.brightness,
+            contrast = settings.contrast,
+            saturation = settings.saturation,
+            warmth = settings.warmth
+        )
+        if (settings.sharpness > 0.001f) {
+            val pixels = IntArray(output.width * output.height)
+            output.getPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+            applyUnsharpSharpen(
+                pixels,
+                output.width,
+                output.height,
+                strength = settings.sharpness.coerceIn(0f, 1.5f) * 0.65f
+            )
+            output.setPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+        }
         return output
     }
 
@@ -528,13 +664,18 @@ object FilterProcessor {
         source: Bitmap,
         cropGeometry: CropGeometry
     ): Bitmap {
+        val safeGeometry = if (AutoCropDetector.isValidGeometry(cropGeometry, minimumArea = 0.005f, minimumEdge = 0.02f)) {
+            cropGeometry
+        } else {
+            AutoCropDetector.fullGeometry()
+        }
         val w = source.width.toFloat()
         val h = source.height.toFloat()
 
-        val tl = PointF(cropGeometry.topLeft.x * w, cropGeometry.topLeft.y * h)
-        val tr = PointF(cropGeometry.topRight.x * w, cropGeometry.topRight.y * h)
-        val br = PointF(cropGeometry.bottomRight.x * w, cropGeometry.bottomRight.y * h)
-        val bl = PointF(cropGeometry.bottomLeft.x * w, cropGeometry.bottomLeft.y * h)
+        val tl = PointF(safeGeometry.topLeft.x * w, safeGeometry.topLeft.y * h)
+        val tr = PointF(safeGeometry.topRight.x * w, safeGeometry.topRight.y * h)
+        val br = PointF(safeGeometry.bottomRight.x * w, safeGeometry.bottomRight.y * h)
+        val bl = PointF(safeGeometry.bottomLeft.x * w, safeGeometry.bottomLeft.y * h)
 
         return cropPerspective(source, tl, tr, br, bl)
     }
@@ -549,18 +690,34 @@ object FilterProcessor {
         bottomRight: PointF,
         bottomLeft: PointF
     ): Bitmap {
+        if (source.isRecycled || source.width <= 0 || source.height <= 0) {
+            throw IllegalArgumentException("Bitmap sumber crop tidak valid")
+        }
+
+        val normalizedGeometry = CropGeometry(
+            topLeft = Offset(topLeft.x / source.width, topLeft.y / source.height),
+            topRight = Offset(topRight.x / source.width, topRight.y / source.height),
+            bottomRight = Offset(bottomRight.x / source.width, bottomRight.y / source.height),
+            bottomLeft = Offset(bottomLeft.x / source.width, bottomLeft.y / source.height)
+        )
+        if (!AutoCropDetector.isValidGeometry(normalizedGeometry, minimumArea = 0.005f, minimumEdge = 0.02f)) {
+            return source.copy(source.config ?: Bitmap.Config.ARGB_8888, false)
+        }
+
+        val maximumDimension = min(8192, max(source.width, source.height) * 2).coerceAtLeast(1)
         val targetWidth = max(
             hypot(topRight.x - topLeft.x, topRight.y - topLeft.y),
             hypot(bottomRight.x - bottomLeft.x, bottomRight.y - bottomLeft.y)
-        ).toInt().coerceIn(100, source.width * 2)
+        ).roundToInt().coerceIn(1, maximumDimension)
 
         val targetHeight = max(
             hypot(bottomLeft.x - topLeft.x, bottomLeft.y - topLeft.y),
             hypot(bottomRight.x - topRight.x, bottomRight.y - topRight.y)
-        ).toInt().coerceIn(100, source.height * 2)
+        ).roundToInt().coerceIn(1, maximumDimension)
 
         val result = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
+        canvas.drawColor(Color.WHITE)
 
         val srcPoints = floatArrayOf(
             topLeft.x, topLeft.y,
@@ -577,7 +734,10 @@ object FilterProcessor {
         )
 
         val matrix = Matrix()
-        matrix.setPolyToPoly(srcPoints, 0, dstPoints, 0, 4)
+        if (!matrix.setPolyToPoly(srcPoints, 0, dstPoints, 0, 4)) {
+            result.recycle()
+            return source.copy(source.config ?: Bitmap.Config.ARGB_8888, false)
+        }
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         canvas.drawBitmap(source, matrix, paint)

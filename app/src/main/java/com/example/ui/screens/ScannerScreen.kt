@@ -58,6 +58,7 @@ import androidx.core.content.FileProvider
 import com.example.core.crop.AutoCropDetector
 import com.example.core.filter.FilterProcessor
 import com.example.core.model.CropGeometry
+import com.example.core.model.FilterSettings
 import com.example.core.model.FilterType
 import com.example.core.ocr.OcrEngine
 import com.example.core.pdf.PdfConverterEngine
@@ -67,7 +68,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.Executors
@@ -81,17 +81,21 @@ data class ScannedPageItem(
     val cropGeometry: CropGeometry? = null,
     val croppedBitmap: Bitmap? = null,
     val rotationDegrees: Int = 0,
-    val filterType: FilterType = FilterType.MAGIC_COLOR,
+    val filterType: FilterType = FilterType.AUTO,
+    val filterSettings: FilterSettings = FilterSettings(),
     val watermarkText: String? = null,
     val ocrText: String? = null
 ) {
-    fun getRenderedBitmap(): Bitmap {
+    fun getRenderedBitmap(maxDimension: Int? = null): Bitmap {
         // 1. Use cropped perspective bitmap if present, otherwise crop with geometry or use original
-        var baseBmp: Bitmap = if (croppedBitmap != null) {
+        var ownsWorkingBitmap = false
+        var workingBitmap: Bitmap = if (croppedBitmap != null) {
             croppedBitmap
         } else if (cropGeometry != null) {
             try {
-                FilterProcessor.cropPerspective(originalBitmap, cropGeometry)
+                FilterProcessor.cropPerspective(originalBitmap, cropGeometry).also {
+                    ownsWorkingBitmap = it !== originalBitmap
+                }
             } catch (e: Exception) {
                 originalBitmap
             }
@@ -99,22 +103,48 @@ data class ScannedPageItem(
             originalBitmap
         }
 
-        // 2. Apply rotation if any
+        // 2. Downscale previews before expensive filters; PDF export leaves maxDimension null.
+        if (maxDimension != null && maxDimension > 0) {
+            val longest = maxOf(workingBitmap.width, workingBitmap.height)
+            if (longest > maxDimension) {
+                val scale = maxDimension.toFloat() / longest
+                val scaled = Bitmap.createScaledBitmap(
+                    workingBitmap,
+                    (workingBitmap.width * scale).toInt().coerceAtLeast(1),
+                    (workingBitmap.height * scale).toInt().coerceAtLeast(1),
+                    true
+                )
+                if (ownsWorkingBitmap && workingBitmap !== scaled && !workingBitmap.isRecycled) workingBitmap.recycle()
+                workingBitmap = scaled
+                ownsWorkingBitmap = true
+            }
+        }
+
+        // 3. Apply rotation if any
         if (rotationDegrees != 0) {
             val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-            val rotated = Bitmap.createBitmap(baseBmp, 0, 0, baseBmp.width, baseBmp.height, matrix, true)
-            baseBmp = rotated
+            val rotated = Bitmap.createBitmap(
+                workingBitmap, 0, 0, workingBitmap.width, workingBitmap.height, matrix, true
+            )
+            if (ownsWorkingBitmap && workingBitmap !== rotated && !workingBitmap.isRecycled) workingBitmap.recycle()
+            workingBitmap = rotated
+            ownsWorkingBitmap = true
         }
 
-        // 3. Apply scanner enhancement filter
-        var rendered = FilterProcessor.applyFilter(baseBmp, filterType)
+        // 4. Apply scanner enhancement preset and professional fine controls.
+        var rendered = FilterProcessor.applyFilter(workingBitmap, filterType, filterSettings)
+        var ownsRendered = ownsWorkingBitmap || rendered !== workingBitmap
+        if (rendered !== workingBitmap && ownsWorkingBitmap && !workingBitmap.isRecycled) workingBitmap.recycle()
 
-        // 4. Apply watermark if present
+        // 5. Apply watermark if present
         if (!watermarkText.isNullOrBlank()) {
-            rendered = drawWatermark(rendered, watermarkText)
+            val watermarked = drawWatermark(rendered, watermarkText)
+            if (ownsRendered && rendered !== watermarked && !rendered.isRecycled) rendered.recycle()
+            rendered = watermarked
+            ownsRendered = true
         }
 
-        return if (rendered === originalBitmap) {
+        return if (!ownsRendered || rendered === originalBitmap || rendered === croppedBitmap) {
             rendered.copy(rendered.config ?: Bitmap.Config.ARGB_8888, false)
         } else {
             rendered
@@ -133,7 +163,8 @@ data class ScannedPageItem(
         }
         canvas.save()
         canvas.rotate(-35f, result.width / 2f, result.height / 2f)
-        for (y in (result.height * 0.2f).toInt()..(result.height * 0.9f).toInt() step (result.height * 0.25f).toInt()) {
+        val watermarkStep = (result.height * 0.25f).toInt().coerceAtLeast(1)
+        for (y in (result.height * 0.2f).toInt()..(result.height * 0.9f).toInt() step watermarkStep) {
             canvas.drawText(text, result.width / 2f, y.toFloat(), paint)
         }
         canvas.restore()
@@ -192,7 +223,6 @@ fun ScannerScreen(
     // Navigation & UI States
     var isReviewMode by remember { mutableStateOf(false) }
     var cropTargetPageIndex by remember { mutableStateOf<Int?>(null) }
-    var pendingCropBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var selectedScanMode by remember { mutableStateOf(ScanMode.MULTI_PAGE) }
     var flashMode by remember { mutableStateOf(ImageCapture.FLASH_MODE_OFF) }
     var showGrid by remember { mutableStateOf(false) }
@@ -212,6 +242,8 @@ fun ScannerScreen(
     // CameraX controllers
     var imageCapture: ImageCapture? by remember { mutableStateOf(null) }
     var cameraControl: CameraControl? by remember { mutableStateOf(null) }
+    var boundCamera: Camera? by remember { mutableStateOf(null) }
+    var previewViewInstance: PreviewView? by remember { mutableStateOf(null) }
     var cameraProviderInstance: ProcessCameraProvider? by remember { mutableStateOf(null) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
@@ -220,6 +252,10 @@ fun ScannerScreen(
             try {
                 cameraProviderInstance?.unbindAll()
                 cameraExecutor.shutdown()
+                scannedPages.forEach { page ->
+                    page.croppedBitmap?.let { if (!it.isRecycled) it.recycle() }
+                    if (!page.originalBitmap.isRecycled) page.originalBitmap.recycle()
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -234,24 +270,12 @@ fun ScannerScreen(
             scope.launch(Dispatchers.IO) {
                 for (uri in uris) {
                     try {
-                        val input: InputStream? = context.contentResolver.openInputStream(uri)
-                        val bmp = BitmapFactory.decodeStream(input)
-                        input?.close()
+                        val bmp = decodeUriBitmap(context, uri)
                         if (bmp != null) {
+                            val page = createAutoCroppedPage(bmp, selectedScanMode)
                             withContext(Dispatchers.Main) {
-                                val detectedGeom = AutoCropDetector.detectDocumentCorners(bmp)
-                                val cropped = try {
-                                    FilterProcessor.cropPerspective(bmp, detectedGeom)
-                                } catch (e: Exception) {
-                                    bmp
-                                }
                                 scannedPages.add(
-                                    ScannedPageItem(
-                                        originalBitmap = bmp,
-                                        cropGeometry = detectedGeom,
-                                        croppedBitmap = cropped,
-                                        filterType = if (selectedScanMode == ScanMode.SMART_CLEAN) FilterType.NO_SHADOW else FilterType.MAGIC_COLOR
-                                    )
+                                    page
                                 )
                             }
                         }
@@ -275,25 +299,11 @@ fun ScannerScreen(
         if (uri != null) {
             scope.launch(Dispatchers.IO) {
                 try {
-                    val input: InputStream? = context.contentResolver.openInputStream(uri)
-                    val bmp = BitmapFactory.decodeStream(input)
-                    input?.close()
+                    val bmp = decodeUriBitmap(context, uri)
                     if (bmp != null) {
+                        val page = createAutoCroppedPage(bmp, selectedScanMode)
                         withContext(Dispatchers.Main) {
-                            val detectedGeom = AutoCropDetector.detectDocumentCorners(bmp)
-                            val cropped = try {
-                                FilterProcessor.cropPerspective(bmp, detectedGeom)
-                            } catch (e: Exception) {
-                                bmp
-                            }
-                            scannedPages.add(
-                                ScannedPageItem(
-                                    originalBitmap = bmp,
-                                    cropGeometry = detectedGeom,
-                                    croppedBitmap = cropped,
-                                    filterType = FilterType.MAGIC_COLOR
-                                )
-                            )
+                            scannedPages.add(page)
                             isReviewMode = true
                         }
                     }
@@ -337,7 +347,7 @@ fun ScannerScreen(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "DokuX memerlukan izin kamera untuk memindai dokumen fisik beresolusi tinggi dan mengekspornya ke PDF.",
+                    text = "DokuPDF memerlukan izin kamera untuk memindai dokumen fisik beresolusi tinggi dan mengekspornya ke PDF.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = Slate400,
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -375,33 +385,7 @@ fun ScannerScreen(
         return
     }
 
-    // 1. Interactive Crop Screen for a single newly captured or imported image
-    if (pendingCropBitmap != null) {
-        InteractiveCropScreen(
-            initialBitmap = pendingCropBitmap!!,
-            onBack = { pendingCropBitmap = null },
-            onCropConfirmed = { croppedBmp, geometry, rotatedBmp ->
-                val filterToApply = when (selectedScanMode) {
-                    ScanMode.SMART_CLEAN -> FilterType.NO_SHADOW
-                    ScanMode.OCR_TEXT -> FilterType.MAGIC_BW_HP
-                    else -> FilterType.MAGIC_COLOR
-                }
-                scannedPages.add(
-                    ScannedPageItem(
-                        originalBitmap = rotatedBmp,
-                        cropGeometry = geometry,
-                        croppedBitmap = croppedBmp,
-                        filterType = filterToApply
-                    )
-                )
-                pendingCropBitmap = null
-                isReviewMode = true
-            }
-        )
-        return
-    }
-
-    // 2. Interactive Crop Screen for an existing page in review
+    // Interactive crop screen for an existing page in review.
     if (cropTargetPageIndex != null && cropTargetPageIndex in scannedPages.indices) {
         val targetPage = scannedPages[cropTargetPageIndex!!]
         InteractiveCropScreen(
@@ -411,11 +395,18 @@ fun ScannerScreen(
             onCropConfirmed = { croppedBmp, geometry, rotatedBmp ->
                 val idx = cropTargetPageIndex!!
                 if (idx in scannedPages.indices) {
-                    scannedPages[idx] = scannedPages[idx].copy(
+                    val previous = scannedPages[idx]
+                    scannedPages[idx] = previous.copy(
                         originalBitmap = rotatedBmp,
                         cropGeometry = geometry,
-                        croppedBitmap = croppedBmp
+                        // Render the crop lazily to avoid retaining two full-resolution bitmaps/page.
+                        croppedBitmap = null
                     )
+                    if (croppedBmp !== rotatedBmp && !croppedBmp.isRecycled) croppedBmp.recycle()
+                    previous.croppedBitmap?.let { if (it !== croppedBmp && !it.isRecycled) it.recycle() }
+                    if (previous.originalBitmap !== rotatedBmp && !previous.originalBitmap.isRecycled) {
+                        previous.originalBitmap.recycle()
+                    }
                 }
                 cropTargetPageIndex = null
             }
@@ -442,6 +433,11 @@ fun ScannerScreen(
                     scannedPages[index] = scannedPages[index].copy(filterType = filter)
                 }
             },
+            onUpdateFilterSettings = { index, settings ->
+                if (index in scannedPages.indices) {
+                    scannedPages[index] = scannedPages[index].copy(filterSettings = settings.normalized())
+                }
+            },
             onRotatePage = { index, deltaDegrees ->
                 if (index in scannedPages.indices) {
                     val currentRot = scannedPages[index].rotationDegrees
@@ -458,10 +454,14 @@ fun ScannerScreen(
                 if (index in scannedPages.indices) {
                     scope.launch(Dispatchers.IO) {
                         val rendered = scannedPages[index].getRenderedBitmap()
-                        val text = ocrEngine.extractTextFromBitmap(rendered)
-                        withContext(Dispatchers.Main) {
-                            ocrDialogText = text
-                            showOcrDialog = true
+                        try {
+                            val text = ocrEngine.extractTextFromBitmap(rendered)
+                            withContext(Dispatchers.Main) {
+                                ocrDialogText = text
+                                showOcrDialog = true
+                            }
+                        } finally {
+                            if (!rendered.isRecycled) rendered.recycle()
                         }
                     }
                 }
@@ -473,13 +473,14 @@ fun ScannerScreen(
                     val fileName = "Scan_Doc_$timeStamp.pdf"
                     val docsDir = File(context.filesDir, "documents").apply { mkdirs() }
                     val destFile = File(docsDir, fileName)
+                    var renderedBitmaps: List<Bitmap> = emptyList()
 
                     try {
-                        val renderedBitmaps = withContext(Dispatchers.Default) {
+                        renderedBitmaps = withContext(Dispatchers.Default) {
                             scannedPages.map { it.getRenderedBitmap() }
                         }
 
-                        val result = converter.bitmapsToPdf(renderedBitmaps, destFile)
+                        val result = converter.bitmapsToPdf(renderedBitmaps, destFile, recycleSource = false)
 
                         if (result.isSuccess) {
                             repository.refreshDocuments()
@@ -494,6 +495,7 @@ fun ScannerScreen(
                             Toast.LENGTH_LONG
                         ).show()
                     } finally {
+                        renderedBitmaps.forEach { if (!it.isRecycled) it.recycle() }
                         isSavingPdf = false
                     }
                 }
@@ -513,18 +515,23 @@ fun ScannerScreen(
                     .fillMaxSize()
                     .pointerInput(Unit) {
                         detectTransformGestures { _, _, zoom, _ ->
-                            cameraControl?.let { control ->
-                                val currentZoom = 0f
-                                control.setLinearZoom((currentZoom + (zoom - 1f) * 0.5f).coerceIn(0f, 1f))
+                            val camera = boundCamera
+                            if (camera != null) {
+                                val zoomState = camera.cameraInfo.zoomState.value
+                                val currentRatio = zoomState?.zoomRatio ?: 1f
+                                val minRatio = zoomState?.minZoomRatio ?: 1f
+                                val maxRatio = zoomState?.maxZoomRatio ?: currentRatio
+                                camera.cameraControl.setZoomRatio(
+                                    (currentRatio * zoom).coerceIn(minRatio, maxRatio)
+                                )
                             }
                         }
                     }
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
+                            val previewView = previewViewInstance
                             cameraControl?.let { control ->
-                                val factory = SurfaceOrientedMeteringPointFactory(
-                                    1f, 1f
-                                )
+                                val factory = previewView?.meteringPointFactory ?: return@let
                                 val point = factory.createPoint(offset.x, offset.y)
                                 val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF)
                                     .setAutoCancelDuration(3, java.util.concurrent.TimeUnit.SECONDS)
@@ -543,6 +550,7 @@ fun ScannerScreen(
                         // CRITICAL: COMPATIBLE mode uses TextureView, preventing SurfaceView BLAST Consumer abandoned BufferQueue errors in Compose
                         implementationMode = PreviewView.ImplementationMode.COMPATIBLE
                     }
+                    previewViewInstance = previewView
 
                     val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
                     cameraProviderFuture.addListener({
@@ -555,7 +563,7 @@ fun ScannerScreen(
                             }
 
                             val capture = ImageCapture.Builder()
-                                .setCaptureMode(if (isHdQuality) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                                 .setFlashMode(flashMode)
                                 .build()
                             imageCapture = capture
@@ -570,6 +578,7 @@ fun ScannerScreen(
                                 capture
                             )
                             cameraControl = cam.cameraControl
+                            boundCamera = cam
                         } catch (exc: Exception) {
                             exc.printStackTrace()
                         }
@@ -655,7 +664,7 @@ fun ScannerScreen(
                             .testTag("scanner_hd_badge")
                     ) {
                         Text(
-                            text = if (isHdQuality) "HD 4K" else "SD",
+                            text = if (isHdQuality) "HD" else "Cepat",
                             color = Color.White,
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
@@ -776,32 +785,31 @@ fun ScannerScreen(
                                     cameraExecutor,
                                     object : ImageCapture.OnImageCapturedCallback() {
                                         override fun onCaptureSuccess(imageProxy: ImageProxy) {
-                                            val bmp = imageProxyToBitmap(imageProxy)
+                                            val bmp = imageProxyToBitmap(
+                                                imageProxy,
+                                                maxDimension = if (isHdQuality) 3200 else 1800
+                                            )
                                             imageProxy.close()
 
-                                            scope.launch(Dispatchers.Main) {
-                                                isCapturing = false
+                                            scope.launch(Dispatchers.Default) {
                                                 if (bmp != null) {
-                                                    val filterToApply = when (selectedScanMode) {
-                                                        ScanMode.SMART_CLEAN -> FilterType.NO_SHADOW
-                                                        ScanMode.OCR_TEXT -> FilterType.MAGIC_BW_HP
-                                                        else -> FilterType.MAGIC_COLOR
-                                                    }
-                                                    scannedPages.add(
-                                                        ScannedPageItem(
-                                                            originalBitmap = bmp,
-                                                            filterType = filterToApply
-                                                        )
-                                                    )
-                                                    if (selectedScanMode == ScanMode.SINGLE_PAGE) {
-                                                        isReviewMode = true
+                                                    val page = createAutoCroppedPage(bmp, selectedScanMode)
+                                                    withContext(Dispatchers.Main) {
+                                                        scannedPages.add(page)
+                                                        isCapturing = false
+                                                        if (selectedScanMode == ScanMode.SINGLE_PAGE) {
+                                                            isReviewMode = true
+                                                        }
                                                     }
                                                 } else {
-                                                    Toast.makeText(
-                                                        context,
-                                                        "Gagal memproses foto (memori tidak cukup). Coba tutup aplikasi lain lalu ulangi.",
-                                                        Toast.LENGTH_SHORT
-                                                    ).show()
+                                                    withContext(Dispatchers.Main) {
+                                                        isCapturing = false
+                                                        Toast.makeText(
+                                                            context,
+                                                            "Gagal memproses foto (memori tidak cukup). Coba tutup aplikasi lain lalu ulangi.",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    }
                                                 }
                                             }
                                         }
@@ -1128,6 +1136,7 @@ fun MultiPageReviewScreen(
     onOpenCrop: (Int) -> Unit,
     onDeletePage: (Int) -> Unit,
     onUpdateFilter: (Int, FilterType) -> Unit,
+    onUpdateFilterSettings: (Int, FilterSettings) -> Unit,
     onRotatePage: (Int, Int) -> Unit,
     onOpenWatermark: (Int) -> Unit,
     onExtractOcr: (Int) -> Unit,
@@ -1135,9 +1144,11 @@ fun MultiPageReviewScreen(
     isSavingPdf: Boolean
 ) {
     val pagerState = rememberPagerState(pageCount = { pages.size })
+    val reviewScope = rememberCoroutineScope()
     val currentPageIndex = pagerState.currentPage.coerceIn(0, (pages.size - 1).coerceAtLeast(0))
     val currentPage = pages.getOrNull(currentPageIndex)
     var isComparingOriginal by remember { mutableStateOf(false) }
+    var showAdjustments by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -1199,12 +1210,19 @@ fun MultiPageReviewScreen(
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
                             color = Slate800
                         )
-                        Text(
-                            text = currentPage?.filterType?.displayName ?: "",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = SleekBluePrimary,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = currentPage?.filterType?.displayName ?: "",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SleekBluePrimary,
+                                fontWeight = FontWeight.Bold
+                            )
+                            TextButton(onClick = { showAdjustments = !showAdjustments }) {
+                                Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text(if (showAdjustments) "Tutup" else "Atur", fontSize = 12.sp)
+                            }
+                        }
                     }
                     Spacer(modifier = Modifier.height(6.dp))
 
@@ -1234,6 +1252,7 @@ fun MultiPageReviewScreen(
                                             .clip(CircleShape)
                                             .background(
                                                 when (filter) {
+                                                    FilterType.AUTO -> SleekBluePrimary
                                                     FilterType.ORIGINAL -> Slate400
                                                     FilterType.MAGIC_COLOR -> Color(0xFF06B6D4)
                                                     FilterType.NO_SHADOW -> Color(0xFF10B981)
@@ -1241,6 +1260,7 @@ fun MultiPageReviewScreen(
                                                     FilterType.GRAYSCALE -> Color.Gray
                                                     FilterType.LIGHTEN -> Color(0xFFF59E0B)
                                                     FilterType.SHARPEN -> Color(0xFF6366F1)
+                                                    FilterType.PHOTO_ENHANCE -> Color(0xFF8B5CF6)
                                                     FilterType.INVERT -> Color(0xFFEC4899)
                                                 }
                                             )
@@ -1253,6 +1273,38 @@ fun MultiPageReviewScreen(
                                         ),
                                         color = if (isSelected) SleekBluePrimary else Slate700
                                     )
+                                }
+                            }
+                        }
+                    }
+
+                    AnimatedVisibility(visible = showAdjustments && currentPage != null) {
+                        currentPage?.let { page ->
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                            ) {
+                                FilterAdjustmentSlider("Cerah", page.filterSettings.brightness, 0.65f..1.35f) {
+                                    onUpdateFilterSettings(currentPageIndex, page.filterSettings.copy(brightness = it))
+                                }
+                                FilterAdjustmentSlider("Kontras", page.filterSettings.contrast, 0.65f..1.8f) {
+                                    onUpdateFilterSettings(currentPageIndex, page.filterSettings.copy(contrast = it))
+                                }
+                                FilterAdjustmentSlider("Warna", page.filterSettings.saturation, 0f..2f) {
+                                    onUpdateFilterSettings(currentPageIndex, page.filterSettings.copy(saturation = it))
+                                }
+                                FilterAdjustmentSlider("Hangat", page.filterSettings.warmth, -1f..1f) {
+                                    onUpdateFilterSettings(currentPageIndex, page.filterSettings.copy(warmth = it))
+                                }
+                                FilterAdjustmentSlider("Tajam", page.filterSettings.sharpness, 0f..1.5f) {
+                                    onUpdateFilterSettings(currentPageIndex, page.filterSettings.copy(sharpness = it))
+                                }
+                                TextButton(
+                                    onClick = { onUpdateFilterSettings(currentPageIndex, FilterSettings()) },
+                                    modifier = Modifier.align(Alignment.End)
+                                ) {
+                                    Text("Reset penyesuaian", fontSize = 12.sp)
                                 }
                             }
                         }
@@ -1356,15 +1408,24 @@ fun MultiPageReviewScreen(
                     modifier = Modifier.fillMaxSize()
                 ) { pageIdx ->
                     val pageItem = pages[pageIdx]
-                    val rendered = remember(
+                    val rendered by produceState<Bitmap?>(
+                        null,
                         pageItem.rotationDegrees,
                         pageItem.filterType,
+                        pageItem.filterSettings,
                         pageItem.originalBitmap,
                         pageItem.croppedBitmap,
                         pageItem.cropGeometry,
                         pageItem.watermarkText
                     ) {
-                        pageItem.getRenderedBitmap()
+                        value = withContext(Dispatchers.Default) {
+                            pageItem.getRenderedBitmap(maxDimension = 1600)
+                        }
+                    }
+                    DisposableEffect(rendered) {
+                        onDispose {
+                            rendered?.let { if (!it.isRecycled) it.recycle() }
+                        }
                     }
 
                     Box(
@@ -1381,12 +1442,19 @@ fun MultiPageReviewScreen(
                         ) {
                             Box(modifier = Modifier.fillMaxSize()) {
                                 val displayBitmap = if (isComparingOriginal) pageItem.originalBitmap else rendered
-                                Image(
-                                    bitmap = displayBitmap.asImageBitmap(),
-                                    contentDescription = "Halaman ${pageIdx + 1}",
-                                    contentScale = ContentScale.Fit,
-                                    modifier = Modifier.fillMaxSize()
-                                )
+                                if (displayBitmap != null) {
+                                    Image(
+                                        bitmap = displayBitmap.asImageBitmap(),
+                                        contentDescription = "Halaman ${pageIdx + 1}",
+                                        contentScale = ContentScale.Fit,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.align(Alignment.Center),
+                                        color = SleekBluePrimary
+                                    )
+                                }
 
                                 // Floating Compare (Bandingkan) Pill Button
                                 Surface(
@@ -1451,6 +1519,9 @@ fun MultiPageReviewScreen(
                             modifier = Modifier
                                 .size(50.dp, 66.dp)
                                 .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    reviewScope.launch { pagerState.animateScrollToPage(idx) }
+                                }
                                 .border(
                                     width = if (isSelected) 2.5.dp else 1.dp,
                                     color = if (isSelected) SleekBluePrimary else Slate300,
@@ -1468,9 +1539,6 @@ fun MultiPageReviewScreen(
                                     .align(Alignment.BottomEnd)
                                     .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(topStart = 4.dp))
                                     .padding(horizontal = 4.dp, vertical = 1.dp)
-                                    .clickable {
-                                        // Scroll to thumbnail
-                                    }
                             ) {
                                 Text("${idx + 1}", color = Color.White, style = MaterialTheme.typography.labelSmall)
                             }
@@ -1479,6 +1547,76 @@ fun MultiPageReviewScreen(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun FilterAdjustmentSlider(
+    label: String,
+    value: Float,
+    range: ClosedFloatingPointRange<Float>,
+    onValueChange: (Float) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, modifier = Modifier.width(62.dp), fontSize = 11.sp, color = Slate700)
+        Slider(
+            value = value.coerceIn(range.start, range.endInclusive),
+            onValueChange = onValueChange,
+            valueRange = range,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            String.format(Locale.getDefault(), "%.2f", value),
+            modifier = Modifier.width(42.dp),
+            fontSize = 10.sp,
+            color = Slate500
+        )
+    }
+}
+
+private fun filterForScanMode(mode: ScanMode): FilterType = when (mode) {
+    ScanMode.SMART_CLEAN -> FilterType.NO_SHADOW
+    ScanMode.ID_CARD -> FilterType.PHOTO_ENHANCE
+    ScanMode.OCR_TEXT -> FilterType.MAGIC_BW_HP
+    else -> FilterType.AUTO
+}
+
+private fun createAutoCroppedPage(bitmap: Bitmap, mode: ScanMode): ScannedPageItem {
+    val detection = AutoCropDetector.detect(bitmap)
+    return ScannedPageItem(
+        originalBitmap = bitmap,
+        cropGeometry = detection.geometry,
+        filterType = filterForScanMode(mode)
+    )
+}
+
+private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = 2600): Bitmap? {
+    return try {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, bounds)
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > maxDimension || bounds.outHeight / sampleSize > maxDimension) {
+            sampleSize *= 2
+        }
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        context.contentResolver.openInputStream(uri)?.use {
+            BitmapFactory.decodeStream(it, null, options)
+        }
+    } catch (oom: OutOfMemoryError) {
+        null
+    } catch (error: Exception) {
+        error.printStackTrace()
+        null
     }
 }
 

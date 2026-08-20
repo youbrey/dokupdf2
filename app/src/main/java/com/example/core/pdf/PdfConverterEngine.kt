@@ -55,9 +55,10 @@ class PdfConverterEngine(
         }
 
         // Compress via JPEG stream to strip 32-bit uncompressed raster bloat
-        val stream = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 82, stream)
-        val bytes = stream.toByteArray()
+        val bytes = ByteArrayOutputStream().use { stream ->
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, 82, stream)) return source
+            stream.toByteArray()
+        }
         val optimized = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
         if (scaled !== source && !scaled.isRecycled) {
@@ -185,12 +186,18 @@ class PdfConverterEngine(
             val ext = if (format == Bitmap.CompressFormat.PNG) "png" else "jpg"
             val baseName = sourcePdf.nameWithoutExtension
 
-            for ((i, bmp) in bitmaps.withIndex()) {
-                val file = File(outputDir, "${baseName}_page_${i + 1}.$ext")
-                FileOutputStream(file).use { out ->
-                    bmp.compress(format, quality, out)
+            try {
+                for ((i, bmp) in bitmaps.withIndex()) {
+                    val file = File(outputDir, "${baseName}_page_${i + 1}.$ext")
+                    FileOutputStream(file).use { out ->
+                        require(bmp.compress(format, quality.coerceIn(0, 100), out)) {
+                            "Gagal menulis halaman ${i + 1}"
+                        }
+                    }
+                    files.add(file)
                 }
-                files.add(file)
+            } finally {
+                bitmaps.forEach { if (!it.isRecycled) it.recycle() }
             }
             Result.success(files)
         } catch (e: Exception) {
@@ -211,23 +218,33 @@ class PdfConverterEngine(
                 return@withContext Result.failure(Exception("PDF tidak memiliki halaman"))
             }
 
-            val totalWidth = bitmaps.maxOf { it.width }
-            val totalHeight = bitmaps.sumOf { it.height }
+            val sourceWidth = bitmaps.maxOf { it.width }
+            val sourceHeight = bitmaps.sumOf { it.height.toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+            val outputScale = minOf(1f, 2400f / sourceWidth, 30000f / sourceHeight)
+            val totalWidth = (sourceWidth * outputScale).toInt().coerceAtLeast(1)
+            val totalHeight = (sourceHeight * outputScale).toInt().coerceAtLeast(1)
 
             val stitched = Bitmap.createBitmap(totalWidth, totalHeight, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(stitched)
-            canvas.drawColor(Color.WHITE)
+            try {
+                val canvas = Canvas(stitched)
+                canvas.drawColor(Color.WHITE)
 
-            var currentY = 0f
-            for (bmp in bitmaps) {
-                val left = (totalWidth - bmp.width) / 2f
-                canvas.drawBitmap(bmp, left, currentY, null)
-                currentY += bmp.height
-            }
+                var currentY = 0f
+                for (bmp in bitmaps) {
+                    val drawWidth = bmp.width * outputScale
+                    val drawHeight = bmp.height * outputScale
+                    val left = (totalWidth - drawWidth) / 2f
+                    canvas.drawBitmap(bmp, null, RectF(left, currentY, left + drawWidth, currentY + drawHeight), pageDrawPaint)
+                    currentY += drawHeight
+                }
 
-            outputFile.parentFile?.mkdirs()
-            FileOutputStream(outputFile).use { out ->
-                stitched.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                outputFile.parentFile?.mkdirs()
+                FileOutputStream(outputFile).use { out ->
+                    require(stitched.compress(Bitmap.CompressFormat.JPEG, 92, out)) { "Gagal menulis gambar panjang" }
+                }
+            } finally {
+                if (!stitched.isRecycled) stitched.recycle()
+                bitmaps.forEach { if (!it.isRecycled) it.recycle() }
             }
             Result.success(outputFile)
         } catch (e: Exception) {
@@ -252,19 +269,26 @@ class PdfConverterEngine(
 
             val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
 
-            for ((index, bmp) in bitmaps.withIndex()) {
-                val rotatedBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
-                val (pageW, pageH) = pdfPageSizePt(rotatedBmp)
-                val pageInfo = PdfDocument.PageInfo.Builder(
-                    pageW,
-                    pageH,
-                    index + 1
-                ).create()
+            try {
+                for ((index, bmp) in bitmaps.withIndex()) {
+                    val rotatedBmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, true)
+                    try {
+                        val (pageW, pageH) = pdfPageSizePt(rotatedBmp)
+                        val pageInfo = PdfDocument.PageInfo.Builder(
+                            pageW,
+                            pageH,
+                            index + 1
+                        ).create()
 
-                val page = pdfDoc.startPage(pageInfo)
-                page.canvas.drawBitmap(rotatedBmp, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
-                pdfDoc.finishPage(page)
-                rotatedBmp.recycle()
+                        val page = pdfDoc.startPage(pageInfo)
+                        page.canvas.drawBitmap(rotatedBmp, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
+                        pdfDoc.finishPage(page)
+                    } finally {
+                        if (rotatedBmp !== bmp && !rotatedBmp.isRecycled) rotatedBmp.recycle()
+                    }
+                }
+            } finally {
+                bitmaps.forEach { if (!it.isRecycled) it.recycle() }
             }
 
             outputPdf.parentFile?.mkdirs()
@@ -291,8 +315,12 @@ class PdfConverterEngine(
             val extractedTextList = mutableListOf<String>()
 
             for (bmp in bitmaps) {
-                val text = ocrEngine.extractTextFromBitmap(bmp)
-                extractedTextList.add(text)
+                try {
+                    val text = ocrEngine.extractTextFromBitmap(bmp)
+                    extractedTextList.add(text)
+                } finally {
+                    if (!bmp.isRecycled) bmp.recycle()
+                }
             }
 
             writeValidDocxZip(outputDocxFile, sourcePdf.nameWithoutExtension, extractedTextList)
@@ -491,16 +519,20 @@ class PdfConverterEngine(
             csvBuilder.append("Halaman,Baris,Teks Kolom 1,Teks Kolom 2,Teks Kolom 3\n")
 
             for ((pageIdx, bmp) in bitmaps.withIndex()) {
-                val text = ocrEngine.extractTextFromBitmap(bmp)
-                val lines = text.lines().filter { it.isNotBlank() }
-                for ((lineIdx, line) in lines.withIndex()) {
-                    val parts = line.split(Regex("\\s{2,}|\t")).map { "\"${it.replace("\"", "\"\"")}\"" }
-                    val col1 = parts.getOrNull(0) ?: "\"\""
-                    val col2 = parts.getOrNull(1) ?: "\"\""
-                    val col3 = parts.drop(2).joinToString(" ")
-                    val col3Clean = if (col3.isNotBlank()) "\"${col3.replace("\"", "\"\"")}\"" else "\"\""
+                try {
+                    val text = ocrEngine.extractTextFromBitmap(bmp)
+                    val lines = text.lines().filter { it.isNotBlank() }
+                    for ((lineIdx, line) in lines.withIndex()) {
+                        val parts = line.split(Regex("\\s{2,}|\t")).map { "\"${it.replace("\"", "\"\"")}\"" }
+                        val col1 = parts.getOrNull(0) ?: "\"\""
+                        val col2 = parts.getOrNull(1) ?: "\"\""
+                        val col3 = parts.drop(2).joinToString(" ")
+                        val col3Clean = if (col3.isNotBlank()) "\"${col3.replace("\"", "\"\"")}\"" else "\"\""
 
-                    csvBuilder.append("${pageIdx + 1},${lineIdx + 1},$col1,$col2,$col3Clean\n")
+                        csvBuilder.append("${pageIdx + 1},${lineIdx + 1},$col1,$col2,$col3Clean\n")
+                    }
+                } finally {
+                    if (!bmp.isRecycled) bmp.recycle()
                 }
             }
 

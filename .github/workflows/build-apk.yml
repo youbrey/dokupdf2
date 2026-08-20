@@ -33,13 +33,18 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
-        # Tidak pin gradle-version di sini secara sengaja: versi Gradle yang dipakai
-        # HARUS mengikuti satu sumber kebenaran, yaitu gradle/wrapper/gradle-wrapper.properties
-        # (karena build dijalankan lewat ./gradlew, bukan `gradle` langsung).
-        # Pinning versi berbeda di sini rawan menciptakan 2 sumber kebenaran yang bisa
-        # kembali bentrok seperti kasus AGP 9.1.1 vs Gradle 8.11.1 sebelumnya.
+        with:
+          # Bootstrap version must match gradle-wrapper.properties. It is required because
+          # the repository previously omitted gradle-wrapper.jar.
+          gradle-version: '9.3.1'
 
       - name: Prepare Environment and Keystore
         run: |
@@ -67,11 +72,14 @@ jobs:
             keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-          # Ensure Gradle wrapper exists and is executable
-          if [ ! -f gradlew ]; then
-            gradle wrapper
+          # Regenerate an incomplete wrapper (the repository previously omitted its JAR).
+          if [ ! -f gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper --gradle-version 9.3.1
           fi
           chmod +x gradlew
+
+      - name: Run Unit and Robolectric Tests
+        run: ./gradlew testDebugUnitTest --stacktrace
 
       - name: Build Debug APK
         if: ${{ github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '' }}

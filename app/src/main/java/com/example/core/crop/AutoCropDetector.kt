@@ -1,176 +1,347 @@
 package com.example.core.crop
 
 import android.graphics.Bitmap
-import android.graphics.Color
-import android.graphics.PointF
 import androidx.compose.ui.geometry.Offset
 import com.example.core.model.CropGeometry
 import kotlin.math.abs
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
+data class AutoCropResult(
+    val geometry: CropGeometry,
+    val confidence: Float,
+    val usedFallback: Boolean
+)
+
 /**
- * Intelligent on-device edge & corner detection for document scanning.
- * Automatically locates the 4 corners of a document on a table/background.
+ * On-device document boundary detector that does not require OpenCV.
+ *
+ * The previous implementation stretched every image to a 300x300 square and sampled only
+ * four diagonal rays. That distorted portrait documents and frequently locked onto text or
+ * table lines instead of the page boundary. This detector preserves aspect ratio, builds
+ * directional Sobel gradients, searches four continuous boundary lines, intersects those
+ * lines, and rejects non-convex or implausibly small quadrilaterals.
  */
 object AutoCropDetector {
 
-    /**
-     * Detects document corners in normalized 0.0f..1.0f coordinates.
-     */
-    fun detectDocumentCorners(bitmap: Bitmap): CropGeometry {
-        val sampleSize = 300
-        val scaleX = bitmap.width.toFloat() / sampleSize
-        val scaleY = bitmap.height.toFloat() / sampleSize
+    private const val ANALYSIS_LONG_EDGE = 420
+    private const val MIN_DOCUMENT_AREA = 0.18f
+    private const val MIN_EDGE_FRACTION = 0.18f
 
-        val scaled = try {
-            Bitmap.createScaledBitmap(bitmap, sampleSize, sampleSize, true)
-        } catch (e: Exception) {
-            return defaultGeometry()
+    private data class LineModel(
+        val slope: Float,
+        val intercept: Float,
+        val score: Float,
+        val coverage: Float
+    )
+
+    fun detectDocumentCorners(bitmap: Bitmap): CropGeometry = detect(bitmap).geometry
+
+    fun detect(bitmap: Bitmap): AutoCropResult {
+        if (bitmap.isRecycled || bitmap.width < 16 || bitmap.height < 16) {
+            return fallbackResult()
         }
 
-        val width = scaled.width
-        val height = scaled.height
-        val pixels = IntArray(width * height)
-        scaled.getPixels(pixels, 0, width, 0, 0, width, height)
+        val longestEdge = max(bitmap.width, bitmap.height).toFloat()
+        val analysisScale = min(1f, ANALYSIS_LONG_EDGE / longestEdge)
+        val analysisWidth = max(16, (bitmap.width * analysisScale).roundToInt())
+        val analysisHeight = max(16, (bitmap.height * analysisScale).roundToInt())
 
-        // Step 1: Compute grayscale luminance and local variance/gradients
-        val luminance = FloatArray(width * height)
-        var sumLuma = 0.0
-        for (i in pixels.indices) {
-            val c = pixels[i]
-            val r = (c shr 16) and 0xFF
-            val g = (c shr 8) and 0xFF
-            val b = c and 0xFF
-            val luma = (0.299f * r + 0.587f * g + 0.114f * b)
-            luminance[i] = luma
-            sumLuma += luma
-        }
-        val avgLuma = (sumLuma / luminance.size).toFloat()
-
-        // Step 2: Compute Sobel edge gradients
-        val edges = FloatArray(width * height)
-        var maxEdge = 1f
-        for (y in 1 until height - 1) {
-            for (x in 1 until width - 1) {
-                val idx = y * width + x
-                val gx = (luminance[idx + 1] - luminance[idx - 1]) +
-                        0.5f * (luminance[idx - width + 1] - luminance[idx - width - 1]) +
-                        0.5f * (luminance[idx + width + 1] - luminance[idx + width - 1])
-                val gy = (luminance[idx + width] - luminance[idx - width]) +
-                        0.5f * (luminance[idx + width + 1] - luminance[idx - width + 1]) +
-                        0.5f * (luminance[idx + width - 1] - luminance[idx - width - 1])
-                val mag = sqrt((gx * gx + gy * gy).toDouble()).toFloat()
-                edges[idx] = mag
-                if (mag > maxEdge) maxEdge = mag
-            }
+        val analysisBitmap = try {
+            if (analysisWidth == bitmap.width && analysisHeight == bitmap.height) bitmap
+            else Bitmap.createScaledBitmap(bitmap, analysisWidth, analysisHeight, true)
+        } catch (_: Throwable) {
+            return fallbackResult()
         }
 
-        // Step 3: Scan along rays from center to 4 corners to find highest gradient transitions
-        val centerX = width / 2f
-        val centerY = height / 2f
+        return try {
+            val pixels = IntArray(analysisWidth * analysisHeight)
+            analysisBitmap.getPixels(pixels, 0, analysisWidth, 0, 0, analysisWidth, analysisHeight)
+            val luma = blurLuminance(pixels, analysisWidth, analysisHeight)
+            val gradientX = FloatArray(luma.size)
+            val gradientY = FloatArray(luma.size)
+            val magnitudes = FloatArray(luma.size)
 
-        // Search rays targeting each corner region
-        val tl = findCornerAlongRay(edges, luminance, width, height, centerX, centerY, 0.05f * width, 0.05f * height, avgLuma)
-        val tr = findCornerAlongRay(edges, luminance, width, height, centerX, centerY, 0.95f * width, 0.05f * height, avgLuma)
-        val br = findCornerAlongRay(edges, luminance, width, height, centerX, centerY, 0.95f * width, 0.95f * height, avgLuma)
-        val bl = findCornerAlongRay(edges, luminance, width, height, centerX, centerY, 0.05f * width, 0.95f * height, avgLuma)
+            computeSobel(luma, analysisWidth, analysisHeight, gradientX, gradientY, magnitudes)
+            val edgeThreshold = percentileThreshold(magnitudes, 0.78f).coerceAtLeast(14f)
 
-        // Normalize points to 0.0f..1.0f range
-        val normTL = Offset((tl.x / width).coerceIn(0.02f, 0.35f), (tl.y / height).coerceIn(0.02f, 0.35f))
-        val normTR = Offset((tr.x / width).coerceIn(0.65f, 0.98f), (tr.y / height).coerceIn(0.02f, 0.35f))
-        val normBR = Offset((br.x / width).coerceIn(0.65f, 0.98f), (br.y / height).coerceIn(0.65f, 0.98f))
-        val normBL = Offset((bl.x / width).coerceIn(0.02f, 0.35f), (bl.y / height).coerceIn(0.65f, 0.98f))
-
-        // Validate quadrilateral area & sanity
-        if (isValidQuad(normTL, normTR, normBR, normBL)) {
-            return CropGeometry(
-                topLeft = normTL,
-                topRight = normTR,
-                bottomRight = normBR,
-                bottomLeft = normBL
+            val left = findVerticalBoundary(
+                gradientX, gradientY, analysisWidth, analysisHeight,
+                minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
+                preferOuter = true, threshold = edgeThreshold
             )
-        }
+            val right = findVerticalBoundary(
+                gradientX, gradientY, analysisWidth, analysisHeight,
+                minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
+                preferOuter = false, threshold = edgeThreshold
+            )
+            val top = findHorizontalBoundary(
+                gradientX, gradientY, analysisWidth, analysisHeight,
+                minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
+                preferOuter = true, threshold = edgeThreshold
+            )
+            val bottom = findHorizontalBoundary(
+                gradientX, gradientY, analysisWidth, analysisHeight,
+                minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
+                preferOuter = false, threshold = edgeThreshold
+            )
 
-        return defaultGeometry()
+            val leftLine = left ?: return fallbackResult()
+            val rightLine = right ?: return fallbackResult()
+            val topLine = top ?: return fallbackResult()
+            val bottomLine = bottom ?: return fallbackResult()
+
+            val tl = intersect(leftLine, topLine, analysisWidth, analysisHeight)
+            val tr = intersect(rightLine, topLine, analysisWidth, analysisHeight)
+            val br = intersect(rightLine, bottomLine, analysisWidth, analysisHeight)
+            val bl = intersect(leftLine, bottomLine, analysisWidth, analysisHeight)
+            val geometry = CropGeometry(tl, tr, br, bl)
+
+            val minimumCoverage = min(
+                min(leftLine.coverage, rightLine.coverage),
+                min(topLine.coverage, bottomLine.coverage)
+            )
+            if (minimumCoverage < 0.055f || !isValidGeometry(geometry)) {
+                fallbackResult()
+            } else {
+                val area = polygonArea(geometry)
+                val confidence = (minimumCoverage * 1.8f + area * 0.45f).coerceIn(0f, 1f)
+                AutoCropResult(geometry, confidence, usedFallback = false)
+            }
+        } catch (_: Throwable) {
+            fallbackResult()
+        } finally {
+            if (analysisBitmap !== bitmap && !analysisBitmap.isRecycled) analysisBitmap.recycle()
+        }
     }
 
-    private fun findCornerAlongRay(
-        edges: FloatArray,
+    private fun blurLuminance(pixels: IntArray, width: Int, height: Int): FloatArray {
+        val source = FloatArray(pixels.size)
+        for (index in pixels.indices) {
+            val pixel = pixels[index]
+            val red = (pixel shr 16) and 0xFF
+            val green = (pixel shr 8) and 0xFF
+            val blue = pixel and 0xFF
+            source[index] = (299 * red + 587 * green + 114 * blue) / 1000f
+        }
+
+        val blurred = source.clone()
+        for (y in 1 until height - 1) {
+            for (x in 1 until width - 1) {
+                val index = y * width + x
+                blurred[index] = (
+                    source[index - width - 1] + source[index - width] * 2f + source[index - width + 1] +
+                        source[index - 1] * 2f + source[index] * 4f + source[index + 1] * 2f +
+                        source[index + width - 1] + source[index + width] * 2f + source[index + width + 1]
+                    ) / 16f
+            }
+        }
+        return blurred
+    }
+
+    private fun computeSobel(
         luminance: FloatArray,
         width: Int,
         height: Int,
-        startX: Float,
-        startY: Float,
-        targetX: Float,
-        targetY: Float,
-        avgLuma: Float
-    ): PointF {
-        val steps = 60
-        var bestX = targetX
-        var bestY = targetY
-        var maxScore = -1f
-
-        val dx = (targetX - startX) / steps
-        val dy = (targetY - startY) / steps
-
-        // Look in outer 60% of ray
-        val startStep = (steps * 0.35f).toInt()
-
-        for (s in startStep..steps) {
-            val curX = (startX + dx * s).toInt().coerceIn(1, width - 2)
-            val curY = (startY + dy * s).toInt().coerceIn(1, height - 2)
-            val idx = curY * width + curX
-
-            val edgeStrength = edges[idx]
-            val lumaDiff = abs(luminance[idx] - avgLuma)
-            val score = edgeStrength * 1.5f + lumaDiff * 0.5f
-
-            if (score > maxScore) {
-                maxScore = score
-                bestX = curX.toFloat()
-                bestY = curY.toFloat()
+        gradientX: FloatArray,
+        gradientY: FloatArray,
+        magnitudes: FloatArray
+    ) {
+        for (y in 1 until height - 1) {
+            for (x in 1 until width - 1) {
+                val index = y * width + x
+                val gx =
+                    -luminance[index - width - 1] + luminance[index - width + 1] -
+                        2f * luminance[index - 1] + 2f * luminance[index + 1] -
+                        luminance[index + width - 1] + luminance[index + width + 1]
+                val gy =
+                    -luminance[index - width - 1] - 2f * luminance[index - width] - luminance[index - width + 1] +
+                        luminance[index + width - 1] + 2f * luminance[index + width] + luminance[index + width + 1]
+                gradientX[index] = gx
+                gradientY[index] = gy
+                magnitudes[index] = hypot(gx.toDouble(), gy.toDouble()).toFloat()
             }
         }
-
-        return PointF(bestX, bestY)
     }
 
-    private fun isValidQuad(tl: Offset, tr: Offset, br: Offset, bl: Offset): Boolean {
-        // Check top width, bottom width, left height, right height
-        val topW = tr.x - tl.x
-        val botW = br.x - bl.x
-        val leftH = bl.y - tl.y
-        val rightH = br.y - tr.y
-
-        if (topW < 0.25f || botW < 0.25f || leftH < 0.25f || rightH < 0.25f) {
-            return false
+    private fun percentileThreshold(values: FloatArray, percentile: Float): Float {
+        val histogram = IntArray(512)
+        var count = 0
+        for (index in values.indices step 2) {
+            val value = values[index]
+            if (value <= 0f || !value.isFinite()) continue
+            histogram[(value / 3f).toInt().coerceIn(0, histogram.lastIndex)]++
+            count++
         }
+        if (count == 0) return 14f
 
-        // Polygon must not self-intersect
-        if (tl.x >= tr.x || bl.x >= br.x || tl.y >= bl.y || tr.y >= br.y) {
-            return false
+        val target = (count * percentile.coerceIn(0f, 1f)).roundToInt()
+        var accumulated = 0
+        for (index in histogram.indices) {
+            accumulated += histogram[index]
+            if (accumulated >= target) return index * 3f
         }
+        return histogram.lastIndex * 3f
+    }
 
+    private fun findVerticalBoundary(
+        gradientX: FloatArray,
+        gradientY: FloatArray,
+        width: Int,
+        height: Int,
+        minBaseFraction: Float,
+        maxBaseFraction: Float,
+        preferOuter: Boolean,
+        threshold: Float
+    ): LineModel? {
+        val minBase = (width * minBaseFraction).roundToInt()
+        val maxBase = (width * maxBaseFraction).roundToInt()
+        val middleY = (height - 1) / 2f
+        var best: LineModel? = null
+
+        var slope = -0.70f
+        while (slope <= 0.7001f) {
+            val normalLength = sqrt(1f + slope * slope)
+            for (base in minBase..maxBase step 2) {
+                var sum = 0f
+                var strong = 0
+                var valid = 0
+                for (y in 2 until height - 2 step 2) {
+                    val x = (base + slope * (y - middleY)).roundToInt()
+                    if (x !in 2 until width - 2) continue
+                    val index = y * width + x
+                    val response = abs(gradientX[index] - slope * gradientY[index]) / normalLength
+                    sum += min(response, threshold * 4f)
+                    if (response >= threshold) strong++
+                    valid++
+                }
+                if (valid == 0) continue
+                val coverage = strong.toFloat() / valid
+                val position = base.toFloat() / width
+                val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
+                val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior
+                if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
+            }
+            slope += 0.05f
+        }
+        return best
+    }
+
+    private fun findHorizontalBoundary(
+        gradientX: FloatArray,
+        gradientY: FloatArray,
+        width: Int,
+        height: Int,
+        minBaseFraction: Float,
+        maxBaseFraction: Float,
+        preferOuter: Boolean,
+        threshold: Float
+    ): LineModel? {
+        val minBase = (height * minBaseFraction).roundToInt()
+        val maxBase = (height * maxBaseFraction).roundToInt()
+        val middleX = (width - 1) / 2f
+        var best: LineModel? = null
+
+        var slope = -0.70f
+        while (slope <= 0.7001f) {
+            val normalLength = sqrt(1f + slope * slope)
+            for (base in minBase..maxBase step 2) {
+                var sum = 0f
+                var strong = 0
+                var valid = 0
+                for (x in 2 until width - 2 step 2) {
+                    val y = (base + slope * (x - middleX)).roundToInt()
+                    if (y !in 2 until height - 2) continue
+                    val index = y * width + x
+                    val response = abs(gradientY[index] - slope * gradientX[index]) / normalLength
+                    sum += min(response, threshold * 4f)
+                    if (response >= threshold) strong++
+                    valid++
+                }
+                if (valid == 0) continue
+                val coverage = strong.toFloat() / valid
+                val position = base.toFloat() / height
+                val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
+                val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior
+                if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
+            }
+            slope += 0.05f
+        }
+        return best
+    }
+
+    /** Vertical line: x = a*y+b. Horizontal line: y = c*x+d. */
+    private fun intersect(vertical: LineModel, horizontal: LineModel, width: Int, height: Int): Offset {
+        val verticalIntercept = vertical.intercept - vertical.slope * ((height - 1) / 2f)
+        val horizontalIntercept = horizontal.intercept - horizontal.slope * ((width - 1) / 2f)
+        val denominator = 1f - vertical.slope * horizontal.slope
+        if (abs(denominator) < 0.05f) return Offset(0.5f, 0.5f)
+
+        val x = (vertical.slope * horizontalIntercept + verticalIntercept) / denominator
+        val y = horizontal.slope * x + horizontalIntercept
+        return Offset(
+            (x / width).coerceIn(0.005f, 0.995f),
+            (y / height).coerceIn(0.005f, 0.995f)
+        )
+    }
+
+    fun isValidGeometry(
+        geometry: CropGeometry,
+        minimumArea: Float = MIN_DOCUMENT_AREA,
+        minimumEdge: Float = MIN_EDGE_FRACTION
+    ): Boolean {
+        val points = listOf(geometry.topLeft, geometry.topRight, geometry.bottomRight, geometry.bottomLeft)
+        if (points.any { !it.x.isFinite() || !it.y.isFinite() || it.x !in 0f..1f || it.y !in 0f..1f }) return false
+        if (polygonArea(geometry) < minimumArea.coerceAtLeast(0f)) return false
+
+        val edges = listOf(
+            distance(points[0], points[1]), distance(points[1], points[2]),
+            distance(points[2], points[3]), distance(points[3], points[0])
+        )
+        if (edges.any { it < minimumEdge.coerceAtLeast(0f) }) return false
+
+        var sign = 0f
+        for (index in points.indices) {
+            val a = points[index]
+            val b = points[(index + 1) % points.size]
+            val c = points[(index + 2) % points.size]
+            val cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+            if (abs(cross) < 0.002f) return false
+            if (sign == 0f) sign = cross else if (sign * cross < 0f) return false
+        }
         return true
     }
 
-    fun defaultGeometry(): CropGeometry {
-        return CropGeometry(
-            topLeft = Offset(0.06f, 0.06f),
-            topRight = Offset(0.94f, 0.06f),
-            bottomRight = Offset(0.94f, 0.94f),
-            bottomLeft = Offset(0.06f, 0.94f)
-        )
+    private fun polygonArea(geometry: CropGeometry): Float {
+        val points = listOf(geometry.topLeft, geometry.topRight, geometry.bottomRight, geometry.bottomLeft)
+        var sum = 0f
+        for (index in points.indices) {
+            val current = points[index]
+            val next = points[(index + 1) % points.size]
+            sum += current.x * next.y - next.x * current.y
+        }
+        return abs(sum) * 0.5f
     }
 
-    fun fullGeometry(): CropGeometry {
-        return CropGeometry(
-            topLeft = Offset(0f, 0f),
-            topRight = Offset(1f, 0f),
-            bottomRight = Offset(1f, 1f),
-            bottomLeft = Offset(0f, 1f)
-        )
-    }
+    private fun distance(first: Offset, second: Offset): Float =
+        hypot((second.x - first.x).toDouble(), (second.y - first.y).toDouble()).toFloat()
+
+    private fun fallbackResult() = AutoCropResult(defaultGeometry(), confidence = 0f, usedFallback = true)
+
+    fun defaultGeometry(): CropGeometry = CropGeometry(
+        topLeft = Offset(0.04f, 0.04f),
+        topRight = Offset(0.96f, 0.04f),
+        bottomRight = Offset(0.96f, 0.96f),
+        bottomLeft = Offset(0.04f, 0.96f)
+    )
+
+    fun fullGeometry(): CropGeometry = CropGeometry(
+        topLeft = Offset.Zero,
+        topRight = Offset(1f, 0f),
+        bottomRight = Offset(1f, 1f),
+        bottomLeft = Offset(0f, 1f)
+    )
 }
