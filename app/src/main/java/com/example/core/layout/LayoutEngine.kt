@@ -26,9 +26,19 @@ class LayoutEngine(
 ) {
 
     fun computeLayout(pages: List<PageModel>, viewportWidth: Float): DocumentLayout {
+        require(viewportWidth.isFinite() && viewportWidth >= 0f) { "Lebar viewport tidak valid" }
+        require(pageSpacing.isFinite() && pageSpacing >= 0f) { "Jarak halaman tidak valid" }
+        require(pagePadding.isFinite() && pagePadding >= 0f) { "Padding halaman tidak valid" }
+        pages.forEachIndexed { index, page ->
+            require(
+                page.width.isFinite() && page.height.isFinite() &&
+                    page.width > 0f && page.height > 0f
+            ) { "Ukuran halaman ${index + 1} tidak valid" }
+        }
         var currentY = pageSpacing
         val pageLayouts = mutableListOf<PageLayoutInfo>()
-        var maxWidth = viewportWidth.coerceAtLeast(600f)
+        val widestPage = pages.maxOfOrNull { it.width + pagePadding * 2f } ?: 0f
+        val maxWidth = maxOf(viewportWidth, widestPage, 600f)
 
         for ((index, page) in pages.withIndex()) {
             val pageWidth = page.width
@@ -49,9 +59,6 @@ class LayoutEngine(
             )
 
             currentY += pageHeight + pageSpacing
-            if (pageWidth > maxWidth) {
-                maxWidth = pageWidth + pagePadding * 2
-            }
         }
 
         return DocumentLayout(
@@ -72,6 +79,9 @@ class LayoutEngine(
      * Converts a document coordinate to normalized page coordinate [0..1, 0..1]
      */
     fun toNormalizedPageCoord(docPoint: Offset, pageLayout: PageLayoutInfo): Offset {
+        require(pageLayout.pageSize.width > 0f && pageLayout.pageSize.height > 0f) {
+            "Ukuran layout halaman tidak valid"
+        }
         val relX = (docPoint.x - pageLayout.bounds.left) / pageLayout.pageSize.width
         val relY = (docPoint.y - pageLayout.bounds.top) / pageLayout.pageSize.height
         return Offset(relX.coerceIn(0f, 1f), relY.coerceIn(0f, 1f))
@@ -81,8 +91,9 @@ class LayoutEngine(
      * Converts normalized page coordinates back to absolute document coordinates
      */
     fun fromNormalizedPageCoord(normPoint: Offset, pageLayout: PageLayoutInfo): Offset {
-        val absX = pageLayout.bounds.left + normPoint.x * pageLayout.pageSize.width
-        val absY = pageLayout.bounds.top + normPoint.y * pageLayout.pageSize.height
+        require(normPoint.x.isFinite() && normPoint.y.isFinite()) { "Koordinat halaman tidak valid" }
+        val absX = pageLayout.bounds.left + normPoint.x.coerceIn(0f, 1f) * pageLayout.pageSize.width
+        val absY = pageLayout.bounds.top + normPoint.y.coerceIn(0f, 1f) * pageLayout.pageSize.height
         return Offset(absX, absY)
     }
 }

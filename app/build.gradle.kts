@@ -37,7 +37,10 @@ android {
       val raw = props.getProperty("GEMINI_API_KEY") ?: System.getenv("GEMINI_API_KEY") ?: ""
       raw.trim().trim('"')
     }
-    buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
+    val escapedGeminiApiKey = geminiApiKey
+      .replace("\\", "\\\\")
+      .replace("\"", "\\\"")
+    buildConfigField("String", "GEMINI_API_KEY", "\"$escapedGeminiApiKey\"")
   }
 
   signingConfigs {
@@ -45,14 +48,8 @@ android {
       val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
       storeFile = file(keystorePath)
       storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
+      keyAlias = System.getenv("KEY_ALIAS") ?: "upload"
       keyPassword = System.getenv("KEY_PASSWORD")
-    }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
     }
   }
 
@@ -62,13 +59,19 @@ android {
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       val releaseKeystore = file(System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks")
-      if (releaseKeystore.exists()) {
+      val hasReleaseCredentials = listOf(
+        System.getenv("STORE_PASSWORD"),
+        System.getenv("KEY_PASSWORD")
+      ).all { !it.isNullOrBlank() }
+      if (releaseKeystore.exists() && hasReleaseCredentials) {
         signingConfig = signingConfigs.getByName("release")
-      } else {
-        signingConfig = signingConfigs.getByName("debugConfig")
       }
+      // Without complete production credentials AGP intentionally emits an unsigned release.
+      // Never disguise a debug key as a production signature.
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    // Keep AGP's standard debug signing config. It creates the normal per-user debug
+    // keystore automatically, so a fresh local clone does not depend on a repository file.
+    debug { }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -100,9 +103,6 @@ dependencies {
   implementation(libs.androidx.compose.ui.tooling.preview)
   implementation(libs.androidx.core.ktx)
   implementation(libs.androidx.lifecycle.runtime.compose)
-  implementation(libs.androidx.lifecycle.runtime.ktx)
-  implementation(libs.androidx.lifecycle.viewmodel.compose)
-  implementation(libs.androidx.navigation.compose)
   implementation(libs.mlkit.text.recognition)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)

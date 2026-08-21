@@ -3,20 +3,23 @@ package com.example.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.*
@@ -37,8 +40,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
 import com.example.core.ai.GeminiAiService
-import com.example.core.ocr.OcrEngine
 import com.example.core.pdf.*
 import com.example.core.repository.SavedDocumentItem
 import com.example.ui.components.SleekTopAppBar
@@ -61,12 +64,13 @@ data class ToolDefinition(
     val category: String
 )
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun PdfToolsScreen(
     documents: List<SavedDocumentItem>,
+    initialToolId: String? = null,
+    initialCategory: String? = null,
     onBack: () -> Unit,
-    onOpenEditor: () -> Unit,
     onRefreshDocuments: () -> Unit
 ) {
     val context = LocalContext.current
@@ -76,8 +80,6 @@ fun PdfToolsScreen(
     val compressor = remember { PdfCompressor(context) }
     val repairEngine = remember { PdfRepairEngine(context) }
     val converterEngine = remember { PdfConverterEngine(context) }
-    val ocrEngine = remember { OcrEngine(context) }
-    val pdfRenderer = remember { PdfRendererEngine(context) }
     val pdfSecurity = remember { PdfSecurity(context) }
     val pdfComparer = remember { PdfComparer(context) }
     val aiService = remember { GeminiAiService() }
@@ -90,11 +92,26 @@ fun PdfToolsScreen(
     var isProcessing by remember { mutableStateOf(false) }
     var resultMessage by remember { mutableStateOf<String?>(null) }
     var copyableResultText by remember { mutableStateOf<String?>(null) }
+    var resultFiles by remember { mutableStateOf<List<File>>(emptyList()) }
+    var resultIsError by remember { mutableStateOf(false) }
 
     // Dynamic parameter states
     val inAppPdfDocs = remember(documents) { documents.filter { it.file.extension.equals("pdf", ignoreCase = true) } }
     var selectedPdfIndex by remember { mutableStateOf(0) }
     var selectedSecondPdfIndex by remember { mutableStateOf(1.coerceAtMost(inAppPdfDocs.lastIndex)) }
+
+    LaunchedEffect(inAppPdfDocs.size) {
+        if (inAppPdfDocs.isEmpty()) {
+            selectedPdfIndex = 0
+            selectedSecondPdfIndex = 0
+        } else {
+            selectedPdfIndex = selectedPdfIndex.coerceIn(inAppPdfDocs.indices)
+            selectedSecondPdfIndex = selectedSecondPdfIndex.coerceIn(inAppPdfDocs.indices)
+            if (inAppPdfDocs.size > 1 && selectedSecondPdfIndex == selectedPdfIndex) {
+                selectedSecondPdfIndex = (selectedPdfIndex + 1) % inAppPdfDocs.size
+            }
+        }
+    }
     
     // Custom Picked Files from Device Storage
     var customPrimaryPdfFile by remember { mutableStateOf<File?>(null) }
@@ -103,27 +120,166 @@ fun PdfToolsScreen(
     
     var passwordInput by remember { mutableStateOf("") }
     var rotationAngle by remember { mutableStateOf(90) }
+    var pagesPerSplit by remember { mutableStateOf(1) }
     var targetLanguage by remember { mutableStateOf("English") }
     var compressionTier by remember { mutableStateOf(CompressionLevel.HIGH) }
 
-    // Helper to copy an external URI to a local cache file
-    fun copyUriToCache(uri: Uri, prefix: String): File? {
-        return try {
-            var fileName = "$prefix-${System.currentTimeMillis()}.pdf"
-            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (cursor.moveToFirst() && nameIndex != -1) {
-                    fileName = cursor.getString(nameIndex)
+    val documentsOutputDir = remember {
+        File(context.filesDir, "documents")
+    }
+    val toolsOutputDir = remember {
+        File(context.filesDir, "tools_output")
+    }
+
+    fun reportSuccess(message: String, files: List<File> = emptyList(), copyText: String? = null) {
+        resultMessage = message
+        resultFiles = files.filter { it.exists() && it.length() > 0L }
+        copyableResultText = copyText
+        resultIsError = false
+    }
+
+    fun reportFailure(message: String) {
+        resultMessage = message
+        resultFiles = emptyList()
+        copyableResultText = null
+        resultIsError = true
+    }
+
+    fun previewText(text: String, maximumCharacters: Int = 6_000): String =
+        if (text.length <= maximumCharacters) text
+        else text.take(maximumCharacters) + "\n\n… Pratinjau dipotong; gunakan Salin Teks untuk hasil lengkap."
+
+    fun clearTemporaryInputs() {
+        listOfNotNull(customPrimaryPdfFile, customSecondPdfFile)
+            .filter { it.parentFile == context.cacheDir }
+            .forEach { it.delete() }
+        customMultiplePdfFiles.filter { it.parentFile == context.cacheDir }.forEach { it.delete() }
+        customPrimaryPdfFile = null
+        customSecondPdfFile = null
+        customMultiplePdfFiles.clear()
+        passwordInput = ""
+    }
+
+    fun clearPrimaryInput() {
+        customPrimaryPdfFile?.takeIf { it.parentFile == context.cacheDir }?.delete()
+        customPrimaryPdfFile = null
+    }
+
+    fun clearSecondInput() {
+        customSecondPdfFile?.takeIf { it.parentFile == context.cacheDir }?.delete()
+        customSecondPdfFile = null
+    }
+
+    fun shareResultFiles(files: List<File>) {
+        if (files.isEmpty()) return
+        runCatching {
+            val uris = ArrayList(files.map { file ->
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            })
+            val intent = if (uris.size == 1) {
+                Intent(Intent.ACTION_SEND).apply {
+                    type = mimeTypeFor(files.first())
+                    putExtra(Intent.EXTRA_STREAM, uris.first())
                 }
+            } else {
+                Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                    type = "*/*"
+                    putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                }
+            }.apply {
+                clipData = ClipData.newUri(context.contentResolver, "Hasil DokuPDF", uris.first()).also { clips ->
+                    uris.drop(1).forEach { uri -> clips.addItem(ClipData.Item(uri)) }
+                }
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val tempFile = File(context.cacheDir, fileName)
-            context.contentResolver.openInputStream(uri)?.use { input ->
-                FileOutputStream(tempFile).use { output -> input.copyTo(output) }
+            context.startActivity(Intent.createChooser(intent, "Bagikan hasil DokuPDF"))
+        }.onFailure { error ->
+            Toast.makeText(context, "Hasil tidak dapat dibagikan: ${error.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    // Copy SAF content off the main thread, sanitize its name, and enforce a storage limit.
+    suspend fun copyUriToCache(
+        uri: Uri,
+        prefix: String,
+        validatePdf: Boolean = true,
+        fallbackExtension: String = if (validatePdf) "pdf" else "bin",
+        maximumBytes: Long = if (validatePdf) {
+            PdfFileUtils.MAX_PDF_INPUT_BYTES
+        } else {
+            PdfFileUtils.MAX_OFFICE_INPUT_BYTES
+        }
+    ): File? =
+        withContext(Dispatchers.IO) {
+            try {
+                var fileName = "$prefix-${System.currentTimeMillis()}.$fallbackExtension"
+                context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (cursor.moveToFirst() && nameIndex != -1) fileName = cursor.getString(nameIndex).orEmpty()
+                }
+                fileName = PdfFileUtils.sanitizeFileName(
+                    fileName,
+                    "$prefix-${System.currentTimeMillis()}.$fallbackExtension"
+                )
+                val lastDot = fileName.lastIndexOf('.')
+                val hasUsableExtension = lastDot in 1 until fileName.lastIndex
+                val requestedExtension = if (hasUsableExtension) {
+                    fileName.substring(lastDot + 1)
+                } else {
+                    fallbackExtension
+                }
+                val extension = requestedExtension
+                    .lowercase(Locale.ROOT)
+                    .takeIf { it.matches(Regex("[a-z0-9]{1,12}")) }
+                    ?: fallbackExtension
+                val baseName = if (hasUsableExtension) fileName.substring(0, lastDot) else fileName
+                val temporary = PdfFileUtils.uniqueFile(
+                    context.cacheDir,
+                    baseName,
+                    extension
+                )
+                try {
+                    val input = requireNotNull(context.contentResolver.openInputStream(uri)) { "Berkas tidak dapat dibuka" }
+                    input.use { source ->
+                        FileOutputStream(temporary).use { output ->
+                            val buffer = ByteArray(32 * 1024)
+                            var copied = 0L
+                            while (true) {
+                                val read = source.read(buffer)
+                                if (read < 0) break
+                                copied += read
+                                require(copied <= maximumBytes) {
+                                    "Berkas melebihi batas ${PdfFileUtils.formatBytes(maximumBytes)}"
+                                }
+                                output.write(buffer, 0, read)
+                            }
+                        }
+                    }
+                    PdfFileUtils.requireReadableFile(temporary)
+                    if (validatePdf) PdfFileUtils.requirePdf(temporary)
+                    temporary
+                } catch (oom: OutOfMemoryError) {
+                    temporary.delete()
+                    throw oom
+                } catch (error: Exception) {
+                    temporary.delete()
+                    throw error
+                }
+            } catch (oom: OutOfMemoryError) {
+                throw oom
+            } catch (error: Exception) {
+                Log.e("DokuPdfTools", "Berkas SAF gagal disalin", error)
+                null
             }
-            if (tempFile.exists() && tempFile.length() > 0) tempFile else null
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
+        }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            listOfNotNull(customPrimaryPdfFile, customSecondPdfFile)
+                .filter { it.parentFile == context.cacheDir }
+                .forEach { it.delete() }
+            customMultiplePdfFiles.filter { it.parentFile == context.cacheDir }.forEach { it.delete() }
+            converterEngine.close()
         }
     }
 
@@ -132,12 +288,29 @@ fun PdfToolsScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            val file = copyUriToCache(uri, "device_pdf")
-            if (file != null) {
-                customPrimaryPdfFile = file
-                Toast.makeText(context, "Berkas dipilih: ${file.name}", Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(context, "Gagal memuat berkas dari perangkat", Toast.LENGTH_SHORT).show()
+            isProcessing = true
+            scope.launch {
+                try {
+                    val isEncryptedContainer = activeActionTool?.id == "unlock_pdf"
+                    val file = copyUriToCache(
+                        uri,
+                        "device_pdf",
+                        validatePdf = !isEncryptedContainer,
+                        fallbackExtension = if (isEncryptedContainer) "dokupdf" else "pdf",
+                        maximumBytes = PdfFileUtils.MAX_PDF_INPUT_BYTES
+                    )
+                    customPrimaryPdfFile?.takeIf { it.parentFile == context.cacheDir }?.delete()
+                    customPrimaryPdfFile = file
+                    Toast.makeText(
+                        context,
+                        file?.let { "Berkas dipilih: ${it.name}" } ?: "Gagal memuat atau memvalidasi berkas",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } catch (_: OutOfMemoryError) {
+                    Toast.makeText(context, "Memori tidak cukup untuk memuat berkas ini.", Toast.LENGTH_LONG).show()
+                } finally {
+                    isProcessing = false
+                }
             }
         }
     }
@@ -146,10 +319,22 @@ fun PdfToolsScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
-            val file = copyUriToCache(uri, "device_pdf_2")
-            if (file != null) {
-                customSecondPdfFile = file
-                Toast.makeText(context, "Berkas kedua dipilih: ${file.name}", Toast.LENGTH_SHORT).show()
+            isProcessing = true
+            scope.launch {
+                try {
+                    val file = copyUriToCache(uri, "device_pdf_2")
+                    customSecondPdfFile?.takeIf { it.parentFile == context.cacheDir }?.delete()
+                    customSecondPdfFile = file
+                    Toast.makeText(
+                        context,
+                        file?.let { "Berkas kedua dipilih: ${it.name}" } ?: "Berkas kedua tidak valid",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } catch (_: OutOfMemoryError) {
+                    Toast.makeText(context, "Memori tidak cukup untuk memuat berkas kedua.", Toast.LENGTH_LONG).show()
+                } finally {
+                    isProcessing = false
+                }
             }
         }
     }
@@ -158,13 +343,24 @@ fun PdfToolsScreen(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri> ->
         if (uris.isNotEmpty()) {
-            val loaded = mutableListOf<File>()
-            for ((i, uri) in uris.withIndex()) {
-                copyUriToCache(uri, "merge_$i")?.let { loaded.add(it) }
+            isProcessing = true
+            scope.launch {
+                val loaded = mutableListOf<File>()
+                try {
+                    for ((i, uri) in uris.withIndex()) {
+                        copyUriToCache(uri, "merge_$i")?.let { loaded.add(it) }
+                    }
+                    customMultiplePdfFiles.filter { it.parentFile == context.cacheDir }.forEach { it.delete() }
+                    customMultiplePdfFiles.clear()
+                    customMultiplePdfFiles.addAll(loaded)
+                    Toast.makeText(context, "${loaded.size} PDF valid dipilih dari perangkat", Toast.LENGTH_SHORT).show()
+                } catch (_: OutOfMemoryError) {
+                    loaded.forEach { it.delete() }
+                    Toast.makeText(context, "Memori tidak cukup untuk memuat seluruh PDF.", Toast.LENGTH_LONG).show()
+                } finally {
+                    isProcessing = false
+                }
             }
-            customMultiplePdfFiles.clear()
-            customMultiplePdfFiles.addAll(loaded)
-            Toast.makeText(context, "${loaded.size} berkas PDF dipilih dari perangkat", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -174,35 +370,34 @@ fun PdfToolsScreen(
         if (uris.isNotEmpty()) {
             isProcessing = true
             scope.launch {
+                val tempImages = mutableListOf<File>()
                 try {
-                    val tempImages = mutableListOf<File>()
                     for ((idx, uri) in uris.withIndex()) {
-                        val tempFile = File(context.cacheDir, "picked_img_${System.currentTimeMillis()}_$idx.jpg")
-                        context.contentResolver.openInputStream(uri)?.use { input ->
-                            FileOutputStream(tempFile).use { output -> input.copyTo(output) }
-                        }
-                        if (tempFile.exists() && tempFile.length() > 0) {
-                            tempImages.add(tempFile)
-                        }
+                        copyUriToCache(uri, "picked_img_$idx", validatePdf = false, fallbackExtension = "img")
+                            ?.let(tempImages::add)
                     }
 
                     if (tempImages.isNotEmpty()) {
                         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                        val exportDir = File(context.filesDir, "tools_output").apply { mkdirs() }
-                        val outFile = File(exportDir, "Foto_Ke_PDF_$timeStamp.pdf")
+                        val outFile = PdfFileUtils.uniqueFile(documentsOutputDir, "Foto_Ke_PDF_$timeStamp", "pdf")
                         val res = converterEngine.imagesToPdf(tempImages, outFile)
                         if (res.isSuccess) {
-                            resultMessage = "Berhasil mengonversi ${tempImages.size} foto menjadi PDF:\n${outFile.name}"
+                            reportSuccess(
+                                "Berhasil mengonversi ${tempImages.size} foto menjadi PDF:\n${outFile.name}",
+                                listOf(outFile)
+                            )
                         } else {
-                            resultMessage = "Gagal konversi gambar ke PDF: ${res.exceptionOrNull()?.message}"
+                            reportFailure("Gagal konversi gambar ke PDF: ${res.exceptionOrNull()?.message}")
                         }
-                        tempImages.forEach { it.delete() }
                     } else {
-                        resultMessage = "Tidak ada gambar yang berhasil dimuat."
+                        reportFailure("Tidak ada gambar yang berhasil dimuat.")
                     }
+                } catch (_: OutOfMemoryError) {
+                    reportFailure("Memori tidak cukup untuk mengonversi kumpulan gambar ini.")
                 } catch (e: Exception) {
-                    resultMessage = "Terjadi kesalahan: ${e.message}"
+                    reportFailure("Terjadi kesalahan: ${e.message}")
                 } finally {
+                    tempImages.forEach { it.delete() }
                     isProcessing = false
                     onRefreshDocuments()
                 }
@@ -216,24 +411,32 @@ fun PdfToolsScreen(
         if (uri != null) {
             isProcessing = true
             scope.launch {
+                var tempDocument: File? = null
                 try {
-                    val tempDocx = File(context.cacheDir, "picked_doc_${System.currentTimeMillis()}.docx")
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(tempDocx).use { output -> input.copyTo(output) }
-                    }
-                    val exportDir = File(context.filesDir, "tools_output").apply { mkdirs() }
+                    val fallbackExtension = if (
+                        context.contentResolver.getType(uri).orEmpty().startsWith("text/")
+                    ) "txt" else "docx"
+                    val selectedDocument = copyUriToCache(
+                        uri,
+                        "picked_doc",
+                        validatePdf = false,
+                        fallbackExtension = fallbackExtension
+                    ) ?: error("Berkas tidak dapat disalin")
+                    tempDocument = selectedDocument
                     val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                    val outFile = File(exportDir, "Word_Ke_PDF_$timeStamp.pdf")
-                    val res = converterEngine.wordToPdf(tempDocx, outFile)
+                    val outFile = PdfFileUtils.uniqueFile(documentsOutputDir, "Word_Ke_PDF_$timeStamp", "pdf")
+                    val res = converterEngine.wordToPdf(selectedDocument, outFile)
                     if (res.isSuccess) {
-                        resultMessage = "Berhasil mengonversi dokumen Word ke PDF:\n${outFile.name}"
+                        reportSuccess("Berhasil mengonversi dokumen Word ke PDF:\n${outFile.name}", listOf(outFile))
                     } else {
-                        resultMessage = "Gagal konversi Word ke PDF: ${res.exceptionOrNull()?.message}"
+                        reportFailure("Gagal konversi Word ke PDF: ${res.exceptionOrNull()?.message}")
                     }
-                    tempDocx.delete()
+                } catch (_: OutOfMemoryError) {
+                    reportFailure("Memori tidak cukup untuk mengonversi dokumen Word/Teks ini.")
                 } catch (e: Exception) {
-                    resultMessage = "Terjadi kesalahan: ${e.message}"
+                    reportFailure("Terjadi kesalahan: ${e.message}")
                 } finally {
+                    tempDocument?.delete()
                     isProcessing = false
                     onRefreshDocuments()
                 }
@@ -247,24 +450,35 @@ fun PdfToolsScreen(
         if (uri != null) {
             isProcessing = true
             scope.launch {
+                var tempSpreadsheet: File? = null
                 try {
-                    val tempCsv = File(context.cacheDir, "picked_csv_${System.currentTimeMillis()}.csv")
-                    context.contentResolver.openInputStream(uri)?.use { input ->
-                        FileOutputStream(tempCsv).use { output -> input.copyTo(output) }
-                    }
-                    val exportDir = File(context.filesDir, "tools_output").apply { mkdirs() }
-                    val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                    val outFile = File(exportDir, "Excel_Ke_PDF_$timeStamp.pdf")
-                    val res = converterEngine.excelToPdf(tempCsv, outFile)
-                    if (res.isSuccess) {
-                        resultMessage = "Berhasil mengonversi data Excel/CSV ke PDF:\n${outFile.name}"
+                    val mimeType = context.contentResolver.getType(uri).orEmpty()
+                    val fallbackExtension = if (mimeType == "text/csv" || mimeType.startsWith("text/")) {
+                        "csv"
                     } else {
-                        resultMessage = "Gagal konversi Excel ke PDF: ${res.exceptionOrNull()?.message}"
+                        "xlsx"
                     }
-                    tempCsv.delete()
+                    val selectedSpreadsheet = copyUriToCache(
+                        uri,
+                        "picked_spreadsheet",
+                        validatePdf = false,
+                        fallbackExtension = fallbackExtension
+                    ) ?: error("Berkas tidak dapat disalin")
+                    tempSpreadsheet = selectedSpreadsheet
+                    val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                    val outFile = PdfFileUtils.uniqueFile(documentsOutputDir, "Excel_Ke_PDF_$timeStamp", "pdf")
+                    val res = converterEngine.excelToPdf(selectedSpreadsheet, outFile)
+                    if (res.isSuccess) {
+                        reportSuccess("Berhasil mengonversi data Excel/CSV ke PDF:\n${outFile.name}", listOf(outFile))
+                    } else {
+                        reportFailure("Gagal konversi Excel ke PDF: ${res.exceptionOrNull()?.message}")
+                    }
+                } catch (_: OutOfMemoryError) {
+                    reportFailure("Memori tidak cukup untuk mengonversi spreadsheet ini.")
                 } catch (e: Exception) {
-                    resultMessage = "Terjadi kesalahan: ${e.message}"
+                    reportFailure("Terjadi kesalahan: ${e.message}")
                 } finally {
+                    tempSpreadsheet?.delete()
                     isProcessing = false
                     onRefreshDocuments()
                 }
@@ -313,7 +527,7 @@ fun PdfToolsScreen(
             ToolDefinition(
                 id = "compress_pdf",
                 title = "Kompres PDF",
-                description = "Kecilkan ukuran berkas PDF hingga 80% tetap jernih",
+                description = "Optimalkan ukuran PDF dan pertahankan hasil asli bila sudah lebih kecil",
                 icon = Icons.Outlined.Compress,
                 iconColor = AccentEmerald,
                 bgColor = AccentEmeraldBg,
@@ -349,7 +563,7 @@ fun PdfToolsScreen(
             ToolDefinition(
                 id = "pdf_to_word",
                 title = "PDF ke Word (DOCX)",
-                description = "Konversi dokumen PDF ke format Word standar yang dapat diedit",
+                description = "Ekstrak teks semua halaman dengan OCR ke DOCX yang dapat diedit",
                 icon = Icons.Outlined.Description,
                 iconColor = SleekBluePrimary,
                 bgColor = SleekBlueLight,
@@ -394,7 +608,7 @@ fun PdfToolsScreen(
             ToolDefinition(
                 id = "excel_to_pdf",
                 title = "Excel ke PDF",
-                description = "Pilih berkas CSV/Excel dan ubah menjadi tabel PDF",
+                description = "Pilih berkas CSV/XLSX dan ubah semua lembar menjadi tabel PDF",
                 icon = Icons.Outlined.TableChart,
                 iconColor = AccentEmerald,
                 bgColor = AccentEmeraldBg,
@@ -403,7 +617,7 @@ fun PdfToolsScreen(
             ToolDefinition(
                 id = "pdf_to_excel",
                 title = "PDF ke Excel (CSV)",
-                description = "Ekstrak data tabular dari PDF ke berkas spreadsheet CSV",
+                description = "Ekstrak teks per halaman dengan OCR ke spreadsheet CSV",
                 icon = Icons.Outlined.GridOn,
                 iconColor = AccentEmerald,
                 bgColor = AccentEmeraldBg,
@@ -444,11 +658,28 @@ fun PdfToolsScreen(
         else tools.filter { it.category == selectedCategory }
     }
 
+    LaunchedEffect(initialToolId, initialCategory) {
+        val requestedTool = tools.firstOrNull { it.id == initialToolId }
+        if (requestedTool != null) {
+            clearTemporaryInputs()
+            resultMessage = null
+            copyableResultText = null
+            resultFiles = emptyList()
+            resultIsError = false
+            selectedCategory = requestedTool.category
+            activeActionTool = requestedTool
+        } else {
+            initialCategory
+                ?.takeIf { it in categories }
+                ?.let { selectedCategory = it }
+        }
+    }
+
     Scaffold(
         topBar = {
             SleekTopAppBar(
                 title = "Pusat Alat PDF & AI",
-                subtitle = "18+ Alat pengolah dokumen profesional & nyata",
+                subtitle = "18 alat pengolah dokumen yang berfungsi nyata",
                 onNavigationClick = onBack,
                 navigationIcon = Icons.AutoMirrored.Filled.ArrowBack
             )
@@ -465,7 +696,9 @@ fun PdfToolsScreen(
 
             // Category Chips
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 categories.forEach { cat ->
@@ -507,12 +740,12 @@ fun PdfToolsScreen(
                     ToolGridCard(
                         tool = tool,
                         onClick = {
+                            clearTemporaryInputs()
                             resultMessage = null
                             copyableResultText = null
+                            resultFiles = emptyList()
+                            resultIsError = false
                             passwordInput = ""
-                            customPrimaryPdfFile = null
-                            customSecondPdfFile = null
-                            customMultiplePdfFiles.clear()
                             activeActionTool = tool
                         }
                     )
@@ -524,15 +757,22 @@ fun PdfToolsScreen(
     // Tool Execution Dialog
     activeActionTool?.let { tool ->
         // Effective primary PDF: custom device file OR chosen in-app document
-        val targetPdf = customPrimaryPdfFile ?: inAppPdfDocs.getOrNull(selectedPdfIndex)?.file
+        val targetPdf = if (tool.id == "unlock_pdf") {
+            customPrimaryPdfFile
+        } else {
+            customPrimaryPdfFile ?: inAppPdfDocs.getOrNull(selectedPdfIndex)?.file
+        }
         val targetSecondPdf = customSecondPdfFile ?: inAppPdfDocs.getOrNull(selectedSecondPdfIndex)?.file
 
         AlertDialog(
             onDismissRequest = {
                 if (!isProcessing) {
+                    clearTemporaryInputs()
                     activeActionTool = null
                     resultMessage = null
                     copyableResultText = null
+                    resultFiles = emptyList()
+                    resultIsError = false
                 }
             },
             title = {
@@ -560,18 +800,18 @@ fun PdfToolsScreen(
                     }
 
                     // Result message view
-                    if (resultMessage != null) {
+                    resultMessage?.let { message ->
                         item {
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
-                                color = SleekBlueLight,
+                                color = if (resultIsError) Color(0xFFFEE2E2) else SleekBlueLight,
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Text(
-                                        text = resultMessage!!,
+                                        text = message,
                                         style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                        color = SleekBlueDark
+                                        color = if (resultIsError) Color(0xFF991B1B) else SleekBlueDark
                                     )
 
                                     if (copyableResultText != null) {
@@ -588,6 +828,37 @@ fun PdfToolsScreen(
                                             Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                                             Spacer(modifier = Modifier.width(6.dp))
                                             Text("Salin Teks", fontSize = 12.sp)
+                                        }
+                                    }
+
+                                    if (resultFiles.isNotEmpty()) {
+                                        Button(
+                                            onClick = { shareResultFiles(resultFiles) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = AccentEmerald),
+                                            modifier = Modifier.align(Alignment.End)
+                                        ) {
+                                            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                if (resultFiles.size == 1) "Bagikan Hasil" else "Bagikan ${resultFiles.size} Hasil",
+                                                fontSize = 12.sp
+                                            )
+                                        }
+                                    }
+
+                                    if (resultIsError) {
+                                        OutlinedButton(
+                                            onClick = {
+                                                resultMessage = null
+                                                resultIsError = false
+                                                resultFiles = emptyList()
+                                                copyableResultText = null
+                                            },
+                                            modifier = Modifier.align(Alignment.End)
+                                        ) {
+                                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Coba Lagi", fontSize = 12.sp)
                                         }
                                     }
                                 }
@@ -630,7 +901,7 @@ fun PdfToolsScreen(
                                     ) {
                                         Icon(Icons.Default.TableChart, contentDescription = null)
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Text("Pilih Berkas CSV / Excel dari Perangkat")
+                                        Text("Pilih Berkas CSV / XLSX dari Perangkat")
                                     }
                                 }
                             }
@@ -689,29 +960,61 @@ fun PdfToolsScreen(
                                 item {
                                     DocumentSelector(
                                         label = if (tool.id == "unlock_pdf") "Pilih kontainer .dokupdf:" else "Pilih Dokumen PDF:",
-                                        pdfDocs = inAppPdfDocs,
+                                        pdfDocs = if (tool.id == "unlock_pdf") emptyList() else inAppPdfDocs,
                                         customFile = customPrimaryPdfFile,
                                         selectedIndex = selectedPdfIndex,
                                         onSelectInApp = {
                                             selectedPdfIndex = it
-                                            customPrimaryPdfFile = null
+                                            clearPrimaryInput()
                                         },
                                         onPickFromDevice = {
                                             singlePdfPicker.launch(if (tool.id == "unlock_pdf") "*/*" else "application/pdf")
                                         },
-                                        onClearCustomFile = { customPrimaryPdfFile = null }
+                                        onClearCustomFile = ::clearPrimaryInput
                                     )
                                 }
                                 item {
                                     OutlinedTextField(
                                         value = passwordInput,
-                                        onValueChange = { passwordInput = it },
+                                        onValueChange = { if (it.length <= 256) passwordInput = it },
                                         label = { Text("Kata Sandi") },
                                         placeholder = { Text("Masukkan kata sandi pengaman") },
                                         visualTransformation = PasswordVisualTransformation(),
                                         singleLine = true,
                                         modifier = Modifier.fillMaxWidth()
                                     )
+                                }
+                            }
+                            "split_pdf" -> {
+                                item {
+                                    DocumentSelector(
+                                        label = "Pilih Dokumen PDF:",
+                                        pdfDocs = inAppPdfDocs,
+                                        customFile = customPrimaryPdfFile,
+                                        selectedIndex = selectedPdfIndex,
+                                        onSelectInApp = {
+                                            selectedPdfIndex = it
+                                            clearPrimaryInput()
+                                        },
+                                        onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
+                                        onClearCustomFile = ::clearPrimaryInput
+                                    )
+                                }
+                                item {
+                                    Text(
+                                        "Jumlah halaman per hasil:",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        listOf(1, 2, 5, 10).forEach { count ->
+                                            FilterChip(
+                                                selected = pagesPerSplit == count,
+                                                onClick = { pagesPerSplit = count },
+                                                label = { Text("$count halaman") }
+                                            )
+                                        }
+                                    }
                                 }
                             }
                             "rotate_pdf" -> {
@@ -723,10 +1026,10 @@ fun PdfToolsScreen(
                                         selectedIndex = selectedPdfIndex,
                                         onSelectInApp = {
                                             selectedPdfIndex = it
-                                            customPrimaryPdfFile = null
+                                            clearPrimaryInput()
                                         },
                                         onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
-                                        onClearCustomFile = { customPrimaryPdfFile = null }
+                                        onClearCustomFile = ::clearPrimaryInput
                                     )
                                 }
                                 item {
@@ -751,19 +1054,20 @@ fun PdfToolsScreen(
                                         selectedIndex = selectedPdfIndex,
                                         onSelectInApp = {
                                             selectedPdfIndex = it
-                                            customPrimaryPdfFile = null
+                                            clearPrimaryInput()
                                         },
                                         onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
-                                        onClearCustomFile = { customPrimaryPdfFile = null }
+                                        onClearCustomFile = ::clearPrimaryInput
                                     )
                                 }
                                 item {
                                     Text("Tingkat Kompresi:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         listOf(
                                             CompressionLevel.LOW to "Rendah",
                                             CompressionLevel.BALANCED to "Sedang",
-                                            CompressionLevel.HIGH to "Maksimal"
+                                            CompressionLevel.HIGH to "Tinggi",
+                                            CompressionLevel.EXTREME to "Ekstrem"
                                         ).forEach { (level, label) ->
                                             FilterChip(
                                                 selected = compressionTier == level,
@@ -783,10 +1087,10 @@ fun PdfToolsScreen(
                                         selectedIndex = selectedPdfIndex,
                                         onSelectInApp = {
                                             selectedPdfIndex = it
-                                            customPrimaryPdfFile = null
+                                            clearPrimaryInput()
                                         },
                                         onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
-                                        onClearCustomFile = { customPrimaryPdfFile = null }
+                                        onClearCustomFile = ::clearPrimaryInput
                                     )
                                 }
                                 item {
@@ -797,10 +1101,10 @@ fun PdfToolsScreen(
                                         selectedIndex = selectedSecondPdfIndex,
                                         onSelectInApp = {
                                             selectedSecondPdfIndex = it
-                                            customSecondPdfFile = null
+                                            clearSecondInput()
                                         },
                                         onPickFromDevice = { secondPdfPicker.launch("application/pdf") },
-                                        onClearCustomFile = { customSecondPdfFile = null }
+                                        onClearCustomFile = ::clearSecondInput
                                     )
                                 }
                             }
@@ -813,20 +1117,20 @@ fun PdfToolsScreen(
                                         selectedIndex = selectedPdfIndex,
                                         onSelectInApp = {
                                             selectedPdfIndex = it
-                                            customPrimaryPdfFile = null
+                                            clearPrimaryInput()
                                         },
                                         onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
-                                        onClearCustomFile = { customPrimaryPdfFile = null }
+                                        onClearCustomFile = ::clearPrimaryInput
                                     )
                                 }
                                 item {
                                     Text("Bahasa Tujuan:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                                     val languages = listOf("English", "Indonesian", "Japanese", "Arabic", "Mandarin", "French", "Spanish", "German")
-                                    Row(
+                                    FlowRow(
                                         modifier = Modifier.fillMaxWidth(),
                                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
-                                        languages.take(4).forEach { lang ->
+                                        languages.forEach { lang ->
                                             FilterChip(
                                                 selected = targetLanguage == lang,
                                                 onClick = { targetLanguage = lang },
@@ -845,10 +1149,10 @@ fun PdfToolsScreen(
                                         selectedIndex = selectedPdfIndex,
                                         onSelectInApp = {
                                             selectedPdfIndex = it
-                                            customPrimaryPdfFile = null
+                                            clearPrimaryInput()
                                         },
                                         onPickFromDevice = { singlePdfPicker.launch("application/pdf") },
-                                        onClearCustomFile = { customPrimaryPdfFile = null }
+                                        onClearCustomFile = ::clearPrimaryInput
                                     )
                                 }
                             }
@@ -876,9 +1180,12 @@ fun PdfToolsScreen(
                 if (resultMessage != null) {
                     Button(
                         onClick = {
+                            clearTemporaryInputs()
                             activeActionTool = null
                             resultMessage = null
                             copyableResultText = null
+                            resultFiles = emptyList()
+                            resultIsError = false
                             onRefreshDocuments()
                         }
                     ) {
@@ -888,9 +1195,11 @@ fun PdfToolsScreen(
                     Button(
                         onClick = {
                             isProcessing = true
+                            resultFiles = emptyList()
+                            resultIsError = false
+                            copyableResultText = null
                             scope.launch {
                                 val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                                val exportDir = File(context.filesDir, "tools_output").apply { mkdirs() }
 
                                 try {
                                     when (tool.id) {
@@ -900,255 +1209,352 @@ fun PdfToolsScreen(
                                             } else {
                                                 inAppPdfDocs.map { it.file }
                                             }
-                                            if (filesToMerge.isNotEmpty()) {
-                                                val outFile = File(exportDir, "PDF_Gabungan_$timeStamp.pdf")
+                                            if (filesToMerge.size >= 2) {
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    documentsOutputDir,
+                                                    "PDF_Gabungan_$timeStamp",
+                                                    "pdf"
+                                                )
                                                 val res = mergerSplitter.mergePdfs(filesToMerge, outFile)
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil menggabungkan ${filesToMerge.size} berkas ke:\n${outFile.name}"
+                                                    reportSuccess(
+                                                        "Berhasil menggabungkan ${filesToMerge.size} PDF ke:\n${outFile.name}",
+                                                        listOf(outFile)
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal menggabungkan PDF: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF dari perangkat atau simpan dokumen di aplikasi terlebih dahulu."
+                                                reportFailure("Pilih setidaknya 2 berkas PDF untuk digabungkan.")
                                             }
                                         }
                                         "split_pdf" -> {
                                             if (targetPdf != null) {
-                                                val res = mergerSplitter.splitPdf(targetPdf, exportDir, pagesPerSplit = 1)
+                                                val res = mergerSplitter.splitPdf(
+                                                    targetPdf,
+                                                    documentsOutputDir,
+                                                    pagesPerSplit = pagesPerSplit
+                                                )
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil memisahkan '${targetPdf.name}' menjadi ${res.getOrNull()?.size} berkas terpisah."
+                                                    val outputs = res.getOrThrow()
+                                                    reportSuccess(
+                                                        "Berhasil memisahkan '${targetPdf.name}' menjadi ${outputs.size} PDF " +
+                                                            "($pagesPerSplit halaman per berkas).",
+                                                        outputs
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal memisahkan PDF: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "rotate_pdf" -> {
                                             if (targetPdf != null) {
-                                                val outFile = File(exportDir, "Rotasi_${rotationAngle}_${targetPdf.name}")
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    documentsOutputDir,
+                                                    "Rotasi_${rotationAngle}_${targetPdf.nameWithoutExtension}",
+                                                    "pdf"
+                                                )
                                                 val res = converterEngine.rotatePdf(targetPdf, outFile, rotationAngle)
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil memutar orientasi ${rotationAngle}°:\n${outFile.name}"
+                                                    reportSuccess(
+                                                        "Berhasil memutar seluruh halaman ${rotationAngle}°:\n${outFile.name}",
+                                                        listOf(outFile)
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal memutar PDF: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal memutar PDF: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "compress_pdf" -> {
                                             if (targetPdf != null) {
-                                                val outFile = File(exportDir, "Kompres_${targetPdf.name}")
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    documentsOutputDir,
+                                                    "Kompres_${targetPdf.nameWithoutExtension}",
+                                                    "pdf"
+                                                )
                                                 val res = compressor.compressPdf(targetPdf, outFile, compressionTier)
                                                 if (res.isSuccess) {
-                                                    val comp = res.getOrNull()!!
-                                                    resultMessage = "Berhasil dikompres! Ukuran hemat ${comp.savedPercentage}% (${comp.compressedSizeBytes / 1024} KB)\nDisimpan di: ${outFile.name}"
+                                                    val comp = res.getOrThrow()
+                                                    val summary = if (comp.savedPercentage > 0) {
+                                                        "Ukuran berkurang ${comp.savedPercentage}% menjadi ${PdfFileUtils.formatBytes(comp.compressedSizeBytes)}."
+                                                    } else {
+                                                        "Dokumen sudah optimal; salinan asli dipertahankan agar hasil tidak membesar."
+                                                    }
+                                                    reportSuccess("$summary\nDisimpan sebagai: ${outFile.name}", listOf(outFile))
                                                 } else {
-                                                    resultMessage = "Gagal: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal mengompresi PDF: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "lock_pdf" -> {
                                             if (targetPdf != null) {
-                                                if (passwordInput.isBlank()) {
-                                                    resultMessage = "Kata sandi tidak boleh kosong!"
+                                                if (passwordInput.length < 8) {
+                                                    reportFailure("Kata sandi minimal 8 karakter.")
                                                 } else {
-                                                    val outFile = File(exportDir, "Terkunci_${targetPdf.nameWithoutExtension}.dokupdf")
+                                                    val outFile = PdfFileUtils.uniqueFile(
+                                                        toolsOutputDir,
+                                                        "Terkunci_${targetPdf.nameWithoutExtension}",
+                                                        "dokupdf"
+                                                    )
                                                     val res = pdfSecurity.lockPdf(targetPdf, outFile, passwordInput)
                                                     if (res.isSuccess) {
-                                                        resultMessage = "Dokumen berhasil diamankan dengan AES-256-GCM dan PBKDF2:\n${outFile.name}\n\nCatatan: ini kontainer DokuPDF terenkripsi, bukan PDF yang dapat dibuka langsung."
+                                                        reportSuccess(
+                                                            "Dokumen diamankan dengan AES-256-GCM dan PBKDF2:\n${outFile.name}\n\n" +
+                                                                "Ini kontainer DokuPDF, bukan PDF yang dapat dibuka langsung.",
+                                                            listOf(outFile)
+                                                        )
                                                     } else {
-                                                        resultMessage = "Gagal mengunci PDF: ${res.exceptionOrNull()?.message}"
+                                                        reportFailure("Gagal mengenkripsi PDF: ${res.exceptionOrNull()?.message}")
                                                     }
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "unlock_pdf" -> {
                                             if (targetPdf != null) {
                                                 if (passwordInput.isBlank()) {
-                                                    resultMessage = "Masukkan kata sandi pembuka kunci!"
+                                                    reportFailure("Masukkan kata sandi pembuka kunci.")
                                                 } else {
-                                                    val outFile = File(exportDir, "Terbuka_${targetPdf.nameWithoutExtension}.pdf")
+                                                    val outFile = PdfFileUtils.uniqueFile(
+                                                        documentsOutputDir,
+                                                        "Terbuka_${targetPdf.nameWithoutExtension}",
+                                                        "pdf"
+                                                    )
                                                     val res = pdfSecurity.unlockPdf(targetPdf, outFile, passwordInput)
                                                     if (res.isSuccess) {
-                                                        resultMessage = "Kunci dokumen berhasil dibuka & didekripsi:\n${outFile.name}"
+                                                        reportSuccess(
+                                                            "Kontainer berhasil didekripsi menjadi PDF:\n${outFile.name}",
+                                                            listOf(outFile)
+                                                        )
                                                     } else {
-                                                        resultMessage = "Gagal: ${res.exceptionOrNull()?.message}"
+                                                        reportFailure("Gagal mendekripsi kontainer: ${res.exceptionOrNull()?.message}")
                                                     }
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih kontainer .dokupdf terlebih dahulu.")
                                             }
                                         }
                                         "repair_pdf" -> {
                                             if (targetPdf != null) {
-                                                val outFile = File(exportDir, "Dipulihkan_${targetPdf.name}")
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    documentsOutputDir,
+                                                    "Dipulihkan_${targetPdf.nameWithoutExtension}",
+                                                    "pdf"
+                                                )
                                                 val res = repairEngine.repairPdf(targetPdf, outFile)
                                                 if (res.isSuccess) {
-                                                    val report = res.getOrNull()!!
-                                                    resultMessage = "Struktur dokumen PDF berhasil dipulihkan & distandarisasi.\nPerbaikan:\n" + report.issuesFixed.joinToString("\n• ", prefix = "• ")
+                                                    val report = res.getOrThrow()
+                                                    reportSuccess(
+                                                        "PDF berhasil divalidasi dan dibangun ulang.\nPerbaikan:\n" +
+                                                            report.issuesFixed.joinToString("\n• ", prefix = "• "),
+                                                        listOf(outFile)
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal memperbaiki: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal memperbaiki PDF: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "compare_pdf" -> {
                                             if (targetPdf != null && targetSecondPdf != null) {
                                                 val res = pdfComparer.comparePdfs(targetPdf, targetSecondPdf)
                                                 if (res.isSuccess) {
-                                                    val comp = res.getOrNull()!!
-                                                    val diffPages = comp.pageResults.count { it.hasDifferences }
-                                                    resultMessage = "Tingkat Kemiripan Dokumen: ${"%.1f".format(comp.overallSimilarityPercentage)}%\n" +
-                                                            "Total Halaman Dibandingkan: ${comp.pageResults.size}\n" +
-                                                            "Halaman dengan perbedaan visual: $diffPages"
+                                                    val comp = res.getOrThrow()
+                                                    val differingPages = comp.pageResults.filter { it.hasDifferences }
+                                                    val pageDetails = differingPages
+                                                        .sortedByDescending { it.differencePercentage }
+                                                        .take(12)
+                                                        .joinToString("\n") { page ->
+                                                            "• Halaman ${page.pageIndex + 1}: ${"%.1f".format(page.differencePercentage)}% berbeda"
+                                                        }
+                                                    val omitted = (differingPages.size - 12).coerceAtLeast(0)
+                                                    reportSuccess(
+                                                        "Tingkat kemiripan visual: ${"%.1f".format(comp.overallSimilarityPercentage)}%\n" +
+                                                            "Halaman dibandingkan: ${comp.pageResults.size}\n" +
+                                                            "Halaman berbeda: ${differingPages.size}" +
+                                                            if (pageDetails.isBlank()) {
+                                                                "\nTidak ada perbedaan visual signifikan."
+                                                            } else {
+                                                                "\n\nRincian per halaman:\n$pageDetails" +
+                                                                    if (omitted > 0) "\n… dan $omitted halaman lain" else ""
+                                                            }
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal membandingkan: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal membandingkan PDF: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih 2 dokumen PDF untuk dibandingkan."
+                                                reportFailure("Pilih 2 dokumen PDF untuk dibandingkan.")
                                             }
                                         }
                                         "pdf_to_word" -> {
                                             if (targetPdf != null) {
-                                                val outFile = File(exportDir, "${targetPdf.nameWithoutExtension}.docx")
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    toolsOutputDir,
+                                                    targetPdf.nameWithoutExtension,
+                                                    "docx"
+                                                )
                                                 val res = converterEngine.pdfToDocx(targetPdf, outFile)
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil dikonversi ke dokumen Word OpenXML (.docx):\n${outFile.name}"
+                                                    reportSuccess(
+                                                        "Teks semua halaman diekstrak dengan OCR ke DOCX:\n${outFile.name}",
+                                                        listOf(outFile)
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal konversi ke Word: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal membuat DOCX: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "pdf_to_image" -> {
                                             if (targetPdf != null) {
-                                                val res = converterEngine.pdfToImages(targetPdf, exportDir)
+                                                val imageDir = PdfFileUtils.uniqueDirectory(
+                                                    toolsOutputDir,
+                                                    PdfFileUtils.sanitizeFileName(
+                                                        "${targetPdf.nameWithoutExtension}_gambar_$timeStamp",
+                                                        "gambar_$timeStamp"
+                                                    )
+                                                )
+                                                val res = converterEngine.pdfToImages(targetPdf, imageDir)
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil mengekstrak ${res.getOrNull()?.size} halaman gambar ke direktori tools_output."
+                                                    val outputs = res.getOrThrow()
+                                                    reportSuccess(
+                                                        "Berhasil mengekstrak ${outputs.size} halaman JPEG. Tekan Bagikan untuk mengekspor.",
+                                                        outputs
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal mengekstrak gambar: ${res.exceptionOrNull()?.message}"
+                                                    imageDir.delete()
+                                                    reportFailure("Gagal mengekstrak gambar: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "pdf_to_long_image" -> {
                                             if (targetPdf != null) {
-                                                val outFile = File(exportDir, "Panjang_${targetPdf.nameWithoutExtension}.jpg")
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    toolsOutputDir,
+                                                    "Panjang_${targetPdf.nameWithoutExtension}",
+                                                    "jpg"
+                                                )
                                                 val res = converterEngine.pdfToLongImage(targetPdf, outFile)
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil menjahit seluruh halaman PDF menjadi gambar panjang:\n${outFile.name}"
+                                                    reportSuccess(
+                                                        "Seluruh halaman berhasil dijahit menjadi gambar panjang:\n${outFile.name}",
+                                                        listOf(outFile)
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal menjahit gambar panjang: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal membuat gambar panjang: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "pdf_to_excel" -> {
                                             if (targetPdf != null) {
-                                                val outFile = File(exportDir, "${targetPdf.nameWithoutExtension}.csv")
+                                                val outFile = PdfFileUtils.uniqueFile(
+                                                    toolsOutputDir,
+                                                    targetPdf.nameWithoutExtension,
+                                                    "csv"
+                                                )
                                                 val res = converterEngine.pdfToExcel(targetPdf, outFile)
                                                 if (res.isSuccess) {
-                                                    resultMessage = "Berhasil mengekstrak tabel data ke berkas CSV:\n${outFile.name}"
+                                                    reportSuccess(
+                                                        "Teks semua halaman diekstrak dengan OCR ke CSV:\n${outFile.name}",
+                                                        listOf(outFile)
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal mengekstrak ke Excel: ${res.exceptionOrNull()?.message}"
+                                                    reportFailure("Gagal membuat CSV: ${res.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "ocr_text" -> {
                                             if (targetPdf != null) {
-                                                val pages = pdfRenderer.renderPdfPages(targetPdf, scale = 2.0f)
-                                                if (pages.isNotEmpty()) {
-                                                    val sb = StringBuilder()
-                                                    for ((idx, page) in pages.withIndex()) {
-                                                        val text = ocrEngine.extractTextFromBitmap(page)
-                                                        if (text.isNotBlank()) {
-                                                            sb.appendLine("--- Halaman ${idx + 1} ---")
-                                                            sb.appendLine(text)
-                                                            sb.appendLine()
-                                                        }
-                                                    }
-                                                    val extractedText = sb.toString().trim()
-                                                    if (extractedText.isNotBlank()) {
-                                                        copyableResultText = extractedText
-                                                        resultMessage = "Hasil Ekstraksi OCR Nyata (${pages.size} Halaman):\n\n$extractedText"
-                                                    } else {
-                                                        resultMessage = "Tidak ada teks yang terdeteksi pada gambar halaman dokumen ini."
-                                                    }
+                                                val extraction = converterEngine.extractTextFromPdf(targetPdf)
+                                                if (extraction.isSuccess) {
+                                                    val extractedText = extraction.getOrThrow()
+                                                    reportSuccess(
+                                                        "Hasil OCR hingga batas aman:\n\n${previewText(extractedText)}",
+                                                        copyText = extractedText
+                                                    )
                                                 } else {
-                                                    resultMessage = "Gagal membaca halaman berkas PDF."
+                                                    reportFailure("OCR gagal: ${extraction.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "ai_translate" -> {
                                             if (targetPdf != null) {
-                                                val pages = pdfRenderer.renderPdfPages(targetPdf, scale = 2.0f)
-                                                val firstPage = pages.firstOrNull()
-                                                if (firstPage != null) {
-                                                    val ocrText = ocrEngine.extractTextFromBitmap(firstPage)
-                                                    if (ocrText.isNotBlank()) {
-                                                        val res = aiService.translateText(ocrText, targetLanguage)
-                                                        if (res.isSuccess) {
-                                                            val translated = res.getOrNull() ?: ""
-                                                            copyableResultText = translated
-                                                            resultMessage = "Hasil Terjemahan ($targetLanguage):\n\n$translated"
-                                                        } else {
-                                                            resultMessage = "Gagal menerjemahkan via AI: ${res.exceptionOrNull()?.message}"
-                                                        }
+                                                val extraction = converterEngine.extractTextFromPdf(
+                                                    targetPdf,
+                                                    includePageHeaders = true,
+                                                    maximumCharacters = 40_000
+                                                )
+                                                if (extraction.isSuccess) {
+                                                    val translated = aiService.translateText(
+                                                        extraction.getOrThrow(),
+                                                        targetLanguage
+                                                    )
+                                                    if (translated.isSuccess) {
+                                                        val text = translated.getOrThrow()
+                                                        reportSuccess(
+                                                            "Hasil terjemahan ($targetLanguage):\n\n${previewText(text)}",
+                                                            copyText = text
+                                                        )
                                                     } else {
-                                                        resultMessage = "Tidak ada teks yang dapat dibaca dari dokumen untuk diterjemahkan."
+                                                        reportFailure("Gagal menerjemahkan via AI: ${translated.exceptionOrNull()?.message}")
                                                     }
                                                 } else {
-                                                    resultMessage = "Gagal membaca halaman dokumen."
+                                                    reportFailure("Teks dokumen tidak dapat diekstrak: ${extraction.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         "ai_spellcheck" -> {
                                             if (targetPdf != null) {
-                                                val pages = pdfRenderer.renderPdfPages(targetPdf, scale = 2.0f)
-                                                val firstPage = pages.firstOrNull()
-                                                if (firstPage != null) {
-                                                    val ocrText = ocrEngine.extractTextFromBitmap(firstPage)
-                                                    if (ocrText.isNotBlank()) {
-                                                        val res = aiService.checkSpellingAndGrammar(ocrText)
-                                                        if (res.isSuccess) {
-                                                            val checkResult = res.getOrNull() ?: ""
-                                                            copyableResultText = checkResult
-                                                            resultMessage = "Analisis Ejaan & Tata Bahasa:\n\n$checkResult"
-                                                        } else {
-                                                            resultMessage = "Gagal memeriksa ejaan via AI: ${res.exceptionOrNull()?.message}"
-                                                        }
+                                                val extraction = converterEngine.extractTextFromPdf(
+                                                    targetPdf,
+                                                    includePageHeaders = true,
+                                                    maximumCharacters = 40_000
+                                                )
+                                                if (extraction.isSuccess) {
+                                                    val checked = aiService.checkSpellingAndGrammar(extraction.getOrThrow())
+                                                    if (checked.isSuccess) {
+                                                        val text = checked.getOrThrow()
+                                                        reportSuccess(
+                                                            "Analisis ejaan dan tata bahasa:\n\n${previewText(text)}",
+                                                            copyText = text
+                                                        )
                                                     } else {
-                                                        resultMessage = "Tidak ada teks yang terbaca pada dokumen untuk diperiksa."
+                                                        reportFailure("Gagal memeriksa ejaan via AI: ${checked.exceptionOrNull()?.message}")
                                                     }
                                                 } else {
-                                                    resultMessage = "Gagal membaca halaman dokumen."
+                                                    reportFailure("Teks dokumen tidak dapat diekstrak: ${extraction.exceptionOrNull()?.message}")
                                                 }
                                             } else {
-                                                resultMessage = "Pilih berkas PDF terlebih dahulu."
+                                                reportFailure("Pilih berkas PDF terlebih dahulu.")
                                             }
                                         }
                                         else -> {
-                                            resultMessage = "Alat '${tool.title}' belum memiliki handler implementasi. Tidak ada berkas yang diubah."
+                                            reportFailure("Handler alat '${tool.title}' tidak dikenali.")
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    resultMessage = "Terjadi kesalahan saat memproses: ${e.message}"
+                                    reportFailure("Terjadi kesalahan saat memproses: ${e.message ?: e::class.java.simpleName}")
+                                } catch (oom: OutOfMemoryError) {
+                                    reportFailure("Memori perangkat tidak cukup. Coba pisahkan dokumen atau gunakan kualitas lebih rendah.")
                                 } finally {
                                     isProcessing = false
                                     onRefreshDocuments()
@@ -1164,7 +1570,15 @@ fun PdfToolsScreen(
             },
             dismissButton = {
                 if (resultMessage == null) {
-                    TextButton(onClick = { activeActionTool = null }, enabled = !isProcessing) {
+                    TextButton(
+                        onClick = {
+                            clearTemporaryInputs()
+                            activeActionTool = null
+                            resultFiles = emptyList()
+                            resultIsError = false
+                        },
+                        enabled = !isProcessing
+                    ) {
                         Text("Batal")
                     }
                 }
@@ -1173,6 +1587,7 @@ fun PdfToolsScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DocumentSelector(
     label: String,
@@ -1183,6 +1598,7 @@ fun DocumentSelector(
     onPickFromDevice: () -> Unit,
     onClearCustomFile: () -> Unit
 ) {
+    var expanded by remember { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(text = label, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Slate700)
 
@@ -1245,40 +1661,50 @@ fun DocumentSelector(
                     style = MaterialTheme.typography.labelSmall,
                     color = Slate500
                 )
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .border(1.dp, Slate200, RoundedCornerShape(8.dp)),
-                    color = SleekSurface
+                ExposedDropdownMenuBox(
+                    expanded = expanded,
+                    onExpandedChange = { expanded = !expanded },
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Column {
-                        pdfDocs.take(6).forEachIndexed { index, doc ->
-                            val isChosen = selectedIndex == index
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onSelectInApp(index) }
-                                    .background(if (isChosen) SleekBlueLight else Color.Transparent)
-                                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                RadioButton(
-                                    selected = isChosen,
-                                    onClick = { onSelectInApp(index) },
-                                    colors = RadioButtonDefaults.colors(selectedColor = SleekBluePrimary)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = doc.title,
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        fontWeight = if (isChosen) FontWeight.Bold else FontWeight.Normal
-                                    ),
-                                    color = if (isChosen) SleekBlueDark else Slate800,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                            }
+                    OutlinedTextField(
+                        value = pdfDocs.getOrNull(selectedIndex)?.title ?: pdfDocs.first().title,
+                        onValueChange = {},
+                        readOnly = true,
+                        singleLine = true,
+                        leadingIcon = {
+                            Icon(Icons.Default.PictureAsPdf, contentDescription = null, tint = Color(0xFFDC2626))
+                        },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                        modifier = Modifier
+                            .menuAnchor()
+                            .fillMaxWidth()
+                    )
+                    ExposedDropdownMenu(
+                        expanded = expanded,
+                        onDismissRequest = { expanded = false }
+                    ) {
+                        pdfDocs.forEachIndexed { index, document ->
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(
+                                            document.title,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            fontWeight = if (index == selectedIndex) FontWeight.Bold else FontWeight.Normal
+                                        )
+                                        Text(
+                                            "${document.pageCount} halaman • ${document.formattedSize}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Slate500
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    onSelectInApp(index)
+                                    expanded = false
+                                }
+                            )
                         }
                     }
                 }
@@ -1336,4 +1762,14 @@ fun ToolGridCard(
             )
         }
     }
+}
+
+private fun mimeTypeFor(file: File): String = when (file.extension.lowercase(Locale.ROOT)) {
+    "pdf" -> "application/pdf"
+    "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    "csv" -> "text/csv"
+    "jpg", "jpeg" -> "image/jpeg"
+    "png" -> "image/png"
+    "dokupdf" -> "application/octet-stream"
+    else -> "application/octet-stream"
 }

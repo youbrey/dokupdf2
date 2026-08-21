@@ -9,7 +9,11 @@ import java.util.ArrayDeque
 /**
  * Manages Undo/Redo stacks and transactional command execution
  */
-class CommandManager(private var initialDoc: DocumentModel) {
+class CommandManager(initialDoc: DocumentModel) {
+
+    private companion object {
+        const val MAX_HISTORY_ENTRIES = 100
+    }
 
     private val undoStack = ArrayDeque<Command>()
     private val redoStack = ArrayDeque<Command>()
@@ -33,6 +37,7 @@ class CommandManager(private var initialDoc: DocumentModel) {
     fun execute(command: Command) {
         val newDoc = command.execute(_documentState.value)
         undoStack.push(command)
+        trimOldest(undoStack)
         redoStack.clear()
         _documentState.value = newDoc.copy(modifiedAt = System.currentTimeMillis())
         updateFlags()
@@ -43,6 +48,7 @@ class CommandManager(private var initialDoc: DocumentModel) {
         val command = undoStack.pop()
         val revertedDoc = command.undo(_documentState.value)
         redoStack.push(command)
+        trimOldest(redoStack)
         _documentState.value = revertedDoc.copy(modifiedAt = System.currentTimeMillis())
         updateFlags()
         return true
@@ -53,6 +59,7 @@ class CommandManager(private var initialDoc: DocumentModel) {
         val command = redoStack.pop()
         val reappliedDoc = command.execute(_documentState.value)
         undoStack.push(command)
+        trimOldest(undoStack)
         _documentState.value = reappliedDoc.copy(modifiedAt = System.currentTimeMillis())
         updateFlags()
         return true
@@ -61,5 +68,9 @@ class CommandManager(private var initialDoc: DocumentModel) {
     private fun updateFlags() {
         _canUndo.value = undoStack.isNotEmpty()
         _canRedo.value = redoStack.isNotEmpty()
+    }
+
+    private fun trimOldest(stack: ArrayDeque<Command>) {
+        while (stack.size > MAX_HISTORY_ENTRIES) stack.removeLast()
     }
 }

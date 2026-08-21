@@ -1,9 +1,11 @@
 package com.example.core.pdf
 
 import android.content.Context
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.BufferedInputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -40,11 +42,11 @@ class PdfSecurity(@Suppress("UNUSED_PARAMETER") context: Context) {
 
     suspend fun lockPdf(sourcePdf: File, outputFile: File, password: String): Result<File> =
         withContext(Dispatchers.IO) {
-            runCatching {
-                require(password.isNotBlank()) { "Kata sandi tidak boleh kosong" }
-                require(sourcePdf.isFile && sourcePdf.length() > 0L) { "Berkas sumber tidak valid" }
-                val rawBytes = FileInputStream(sourcePdf).use { it.readBytes() }
-                require(isPdf(rawBytes)) { "Berkas sumber bukan PDF yang valid" }
+            try {
+                require(password.length >= 8) { "Kata sandi baru harus terdiri dari minimal 8 karakter" }
+                require(password.length <= 256) { "Kata sandi maksimal 256 karakter" }
+                PdfFileUtils.requirePdf(sourcePdf)
+                PdfFileUtils.requireDistinct(sourcePdf, outputFile)
 
                 val random = SecureRandom()
                 val salt = ByteArray(SALT_SIZE).also(random::nextBytes)
@@ -53,35 +55,73 @@ class PdfSecurity(@Suppress("UNUSED_PARAMETER") context: Context) {
                 val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
                 cipher.init(Cipher.ENCRYPT_MODE, deriveV3Key(password, salt), GCMParameterSpec(GCM_TAG_BITS, iv))
                 cipher.updateAAD(header)
-                val encrypted = cipher.doFinal(rawBytes)
 
-                outputFile.parentFile?.mkdirs()
-                FileOutputStream(outputFile).use { output ->
-                    output.write(header)
-                    output.write(salt)
-                    output.write(iv)
-                    output.write(encrypted)
+                PdfFileUtils.writeAtomically(outputFile, minimumBytes = (header.size + SALT_SIZE + GCM_IV_SIZE + 16).toLong()) { temporary ->
+                    FileInputStream(sourcePdf).use { input ->
+                        FileOutputStream(temporary).use { output ->
+                            output.write(header)
+                            output.write(salt)
+                            output.write(iv)
+                            transformStream(input, output, cipher)
+                        }
+                    }
                 }
-                outputFile
+                Result.success(outputFile)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (oom: OutOfMemoryError) {
+                Result.failure(IllegalStateException("Memori tidak cukup untuk mengenkripsi dokumen", oom))
+            } catch (error: Exception) {
+                Result.failure(error)
             }
         }
 
     suspend fun unlockPdf(sourceFile: File, outputPdf: File, password: String): Result<File> =
         withContext(Dispatchers.IO) {
-            runCatching {
+            try {
                 require(password.isNotBlank()) { "Kata sandi tidak boleh kosong" }
-                require(sourceFile.isFile && sourceFile.length() > 0L) { "Berkas sumber tidak valid" }
-                val bytes = FileInputStream(sourceFile).use { it.readBytes() }
-                val decrypted = decryptContainer(bytes, password)
-                require(isPdf(decrypted)) { "Kata sandi salah atau isi hasil dekripsi bukan PDF" }
+                require(password.length <= 256) { "Kata sandi maksimal 256 karakter" }
+                PdfFileUtils.requireReadableFile(sourceFile, "Kontainer DokuPDF", PdfFileUtils.MAX_PDF_INPUT_BYTES)
+                PdfFileUtils.requireDistinct(sourceFile, outputPdf)
+                val header = detectHeader(sourceFile)
 
-                outputPdf.parentFile?.mkdirs()
-                FileOutputStream(outputPdf).use { it.write(decrypted) }
-                outputPdf
-            }.recoverCatching { error ->
-                throw IllegalArgumentException(
-                    "Kata sandi salah, berkas berubah, atau format enkripsi tidak didukung",
-                    error
+                PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporary ->
+                    BufferedInputStream(FileInputStream(sourceFile)).use { input ->
+                        input.skipExactly(header.size.toLong())
+                        val cipher = when {
+                            header.contentEquals(HEADER_MAGIC_V3.toByteArray(Charsets.UTF_8)) -> {
+                                val salt = input.readExactly(SALT_SIZE)
+                                val iv = input.readExactly(GCM_IV_SIZE)
+                                Cipher.getInstance(AES_GCM_TRANSFORMATION).apply {
+                                    init(Cipher.DECRYPT_MODE, deriveV3Key(password, salt), GCMParameterSpec(GCM_TAG_BITS, iv))
+                                    updateAAD(header)
+                                }
+                            }
+                            header.contentEquals(HEADER_MAGIC_V2.toByteArray(Charsets.UTF_8)) -> {
+                                val iv = input.readExactly(CBC_IV_SIZE)
+                                Cipher.getInstance(AES_CBC_TRANSFORMATION).apply {
+                                    init(Cipher.DECRYPT_MODE, deriveLegacyKey(password), IvParameterSpec(iv))
+                                }
+                            }
+                            else -> Cipher.getInstance(AES_ECB_TRANSFORMATION).apply {
+                                init(Cipher.DECRYPT_MODE, deriveLegacyKey(password))
+                            }
+                        }
+                        FileOutputStream(temporary).use { output -> transformStream(input, output, cipher) }
+                    }
+                    PdfFileUtils.requirePdf(temporary, "Hasil dekripsi")
+                }
+                Result.success(outputPdf)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (oom: OutOfMemoryError) {
+                Result.failure(IllegalStateException("Memori tidak cukup untuk mendekripsi dokumen", oom))
+            } catch (error: Exception) {
+                Result.failure(
+                    IllegalArgumentException(
+                        "Kata sandi salah, berkas berubah, atau format enkripsi tidak didukung",
+                        error
+                    )
                 )
             }
         }
@@ -101,36 +141,22 @@ class PdfSecurity(@Suppress("UNUSED_PARAMETER") context: Context) {
         }.getOrDefault(false)
     }
 
-    private fun decryptContainer(bytes: ByteArray, password: String): ByteArray {
+    private fun detectHeader(file: File): ByteArray {
         val headerV3 = HEADER_MAGIC_V3.toByteArray(Charsets.UTF_8)
         val headerV2 = HEADER_MAGIC_V2.toByteArray(Charsets.UTF_8)
         val headerV1 = HEADER_MAGIC_V1.toByteArray(Charsets.UTF_8)
 
+        val maximumLength = maxOf(headerV1.size, headerV2.size, headerV3.size)
+        val prefix = FileInputStream(file).use { input ->
+            ByteArray(maximumLength).also { buffer ->
+                val read = input.read(buffer)
+                require(read > 0) { "Kontainer DokuPDF kosong" }
+            }
+        }
         return when {
-            bytes.startsWith(headerV3) -> {
-                val metadataEnd = headerV3.size + SALT_SIZE + GCM_IV_SIZE
-                require(bytes.size > metadataEnd + 16) { "Kontainer V3 terpotong" }
-                val salt = bytes.copyOfRange(headerV3.size, headerV3.size + SALT_SIZE)
-                val iv = bytes.copyOfRange(headerV3.size + SALT_SIZE, metadataEnd)
-                val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
-                cipher.init(Cipher.DECRYPT_MODE, deriveV3Key(password, salt), GCMParameterSpec(GCM_TAG_BITS, iv))
-                cipher.updateAAD(headerV3)
-                cipher.doFinal(bytes, metadataEnd, bytes.size - metadataEnd)
-            }
-            bytes.startsWith(headerV2) -> {
-                val payloadOffset = headerV2.size + CBC_IV_SIZE
-                require(bytes.size > payloadOffset) { "Kontainer V2 terpotong" }
-                val iv = bytes.copyOfRange(headerV2.size, payloadOffset)
-                val cipher = Cipher.getInstance(AES_CBC_TRANSFORMATION)
-                cipher.init(Cipher.DECRYPT_MODE, deriveLegacyKey(password), IvParameterSpec(iv))
-                cipher.doFinal(bytes, payloadOffset, bytes.size - payloadOffset)
-            }
-            bytes.startsWith(headerV1) -> {
-                require(bytes.size > headerV1.size) { "Kontainer V1 terpotong" }
-                val cipher = Cipher.getInstance(AES_ECB_TRANSFORMATION)
-                cipher.init(Cipher.DECRYPT_MODE, deriveLegacyKey(password))
-                cipher.doFinal(bytes, headerV1.size, bytes.size - headerV1.size)
-            }
+            prefix.hasPrefix(headerV3) -> headerV3
+            prefix.hasPrefix(headerV2) -> headerV2
+            prefix.hasPrefix(headerV1) -> headerV1
             else -> throw IllegalArgumentException("Berkas bukan kontainer DokuPDF terenkripsi")
         }
     }
@@ -150,13 +176,46 @@ class PdfSecurity(@Suppress("UNUSED_PARAMETER") context: Context) {
         return SecretKeySpec(keyBytes, "AES")
     }
 
-    private fun ByteArray.startsWith(prefix: ByteArray): Boolean {
+    private fun ByteArray.hasPrefix(prefix: ByteArray): Boolean {
         if (size < prefix.size) return false
         for (index in prefix.indices) if (this[index] != prefix[index]) return false
         return true
     }
 
-    private fun isPdf(bytes: ByteArray): Boolean =
-        bytes.size >= 5 && bytes[0] == '%'.code.toByte() && bytes[1] == 'P'.code.toByte() &&
-            bytes[2] == 'D'.code.toByte() && bytes[3] == 'F'.code.toByte() && bytes[4] == '-'.code.toByte()
+    private fun transformStream(input: java.io.InputStream, output: java.io.OutputStream, cipher: Cipher) {
+        val buffer = ByteArray(32 * 1024)
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            if (read == 0) continue
+            val transformed = cipher.update(buffer, 0, read)
+            if (transformed != null && transformed.isNotEmpty()) output.write(transformed)
+        }
+        val finalBytes = cipher.doFinal()
+        if (finalBytes.isNotEmpty()) output.write(finalBytes)
+    }
+
+    private fun java.io.InputStream.readExactly(length: Int): ByteArray {
+        val result = ByteArray(length)
+        var offset = 0
+        while (offset < length) {
+            val read = read(result, offset, length - offset)
+            require(read > 0) { "Kontainer DokuPDF terpotong" }
+            offset += read
+        }
+        return result
+    }
+
+    private fun java.io.InputStream.skipExactly(length: Long) {
+        var remaining = length
+        while (remaining > 0L) {
+            val skipped = skip(remaining)
+            if (skipped > 0L) {
+                remaining -= skipped
+            } else {
+                require(read() >= 0) { "Kontainer DokuPDF terpotong" }
+                remaining--
+            }
+        }
+    }
 }

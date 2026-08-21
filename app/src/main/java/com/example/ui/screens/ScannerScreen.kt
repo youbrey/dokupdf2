@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
+import android.media.ExifInterface
 import android.net.Uri
 import android.util.Log
 import android.view.ViewGroup
@@ -64,7 +65,8 @@ import com.example.core.model.FilterSettings
 import com.example.core.model.FilterType
 import com.example.core.ocr.OcrEngine
 import com.example.core.pdf.PdfConverterEngine
-import com.example.core.repository.DocumentRepository
+import com.example.core.pdf.PdfFileUtils
+import com.example.core.pdf.PdfRendererEngine
 import com.example.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -89,67 +91,110 @@ data class ScannedPageItem(
     val ocrText: String? = null
 ) {
     fun getRenderedBitmap(maxDimension: Int? = null): Bitmap {
-        // 1. Use cropped perspective bitmap if present, otherwise crop with geometry or use original
-        var ownsWorkingBitmap = false
-        var workingBitmap: Bitmap = if (croppedBitmap != null) {
-            croppedBitmap
-        } else if (cropGeometry != null) {
-            try {
-                FilterProcessor.cropPerspective(originalBitmap, cropGeometry).also {
-                    ownsWorkingBitmap = it !== originalBitmap
-                }
-            } catch (e: Exception) {
-                originalBitmap
-            }
-        } else {
-            originalBitmap
+        require(!originalBitmap.isRecycled && originalBitmap.width > 0 && originalBitmap.height > 0) {
+            "Bitmap sumber halaman tidak valid"
         }
+        require(croppedBitmap == null || (!croppedBitmap.isRecycled && croppedBitmap.width > 0 && croppedBitmap.height > 0)) {
+            "Bitmap crop halaman tidak valid"
+        }
+        // 1. Use cropped perspective bitmap if present, otherwise crop with geometry or use original.
+        // Preview downsampling happens before perspective/filter passes to keep peak memory bounded.
+        var ownsWorkingBitmap = false
+        var workingBitmap: Bitmap = croppedBitmap ?: originalBitmap
+        var renderedBitmap: Bitmap? = null
+        var ownsRenderedBitmap = false
 
-        // 2. Downscale previews before expensive filters; PDF export leaves maxDimension null.
-        if (maxDimension != null && maxDimension > 0) {
-            val longest = maxOf(workingBitmap.width, workingBitmap.height)
-            if (longest > maxDimension) {
-                val scale = maxDimension.toFloat() / longest
-                val scaled = Bitmap.createScaledBitmap(
-                    workingBitmap,
-                    (workingBitmap.width * scale).toInt().coerceAtLeast(1),
-                    (workingBitmap.height * scale).toInt().coerceAtLeast(1),
-                    true
+        try {
+            if (maxDimension != null && maxDimension > 0) {
+                val longest = maxOf(workingBitmap.width, workingBitmap.height)
+                if (longest > maxDimension) {
+                    val scale = maxDimension.toFloat() / longest
+                    workingBitmap = Bitmap.createScaledBitmap(
+                        workingBitmap,
+                        (workingBitmap.width * scale).toInt().coerceAtLeast(1),
+                        (workingBitmap.height * scale).toInt().coerceAtLeast(1),
+                        true
+                    )
+                    ownsWorkingBitmap = workingBitmap !== originalBitmap && workingBitmap !== croppedBitmap
+                }
+            }
+
+            if (croppedBitmap == null && cropGeometry != null) {
+                val cropSource = workingBitmap
+                try {
+                    val cropped = FilterProcessor.cropPerspective(cropSource, cropGeometry)
+                    if (ownsWorkingBitmap && cropped !== cropSource && !cropSource.isRecycled) {
+                        cropSource.recycle()
+                    }
+                    workingBitmap = cropped
+                    ownsWorkingBitmap = cropped !== originalBitmap && cropped !== croppedBitmap
+                } catch (e: Exception) {
+                    // Invalid geometry degrades to the still-valid preview source. OOM is deliberately
+                    // not swallowed so callers can report an honest memory error.
+                    workingBitmap = cropSource
+                }
+            }
+
+            // 2. Ensure a pre-cropped bitmap supplied by a caller is also within the preview budget.
+            if (maxDimension != null && maxDimension > 0) {
+                val longest = maxOf(workingBitmap.width, workingBitmap.height)
+                if (longest > maxDimension) {
+                    val scale = maxDimension.toFloat() / longest
+                    val scaled = Bitmap.createScaledBitmap(
+                        workingBitmap,
+                        (workingBitmap.width * scale).toInt().coerceAtLeast(1),
+                        (workingBitmap.height * scale).toInt().coerceAtLeast(1),
+                        true
+                    )
+                    if (ownsWorkingBitmap && workingBitmap !== scaled && !workingBitmap.isRecycled) workingBitmap.recycle()
+                    workingBitmap = scaled
+                    ownsWorkingBitmap = true
+                }
+            }
+
+            // 3. Apply rotation if any
+            if (rotationDegrees != 0) {
+                val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                val rotated = Bitmap.createBitmap(
+                    workingBitmap, 0, 0, workingBitmap.width, workingBitmap.height, matrix, true
                 )
-                if (ownsWorkingBitmap && workingBitmap !== scaled && !workingBitmap.isRecycled) workingBitmap.recycle()
-                workingBitmap = scaled
+                if (ownsWorkingBitmap && workingBitmap !== rotated && !workingBitmap.isRecycled) workingBitmap.recycle()
+                workingBitmap = rotated
                 ownsWorkingBitmap = true
             }
-        }
 
-        // 3. Apply rotation if any
-        if (rotationDegrees != 0) {
-            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-            val rotated = Bitmap.createBitmap(
-                workingBitmap, 0, 0, workingBitmap.width, workingBitmap.height, matrix, true
-            )
-            if (ownsWorkingBitmap && workingBitmap !== rotated && !workingBitmap.isRecycled) workingBitmap.recycle()
-            workingBitmap = rotated
-            ownsWorkingBitmap = true
-        }
+            // 4. Apply scanner enhancement preset and professional fine controls.
+            var rendered = FilterProcessor.applyFilter(workingBitmap, filterType, filterSettings)
+            var ownsRendered = ownsWorkingBitmap || rendered !== workingBitmap
+            renderedBitmap = rendered
+            ownsRenderedBitmap = ownsRendered
+            if (rendered !== workingBitmap && ownsWorkingBitmap && !workingBitmap.isRecycled) workingBitmap.recycle()
 
-        // 4. Apply scanner enhancement preset and professional fine controls.
-        var rendered = FilterProcessor.applyFilter(workingBitmap, filterType, filterSettings)
-        var ownsRendered = ownsWorkingBitmap || rendered !== workingBitmap
-        if (rendered !== workingBitmap && ownsWorkingBitmap && !workingBitmap.isRecycled) workingBitmap.recycle()
+            // 5. Apply watermark if present
+            if (!watermarkText.isNullOrBlank()) {
+                val watermarked = drawWatermark(rendered, watermarkText)
+                if (ownsRendered && rendered !== watermarked && !rendered.isRecycled) rendered.recycle()
+                rendered = watermarked
+                ownsRendered = true
+                renderedBitmap = rendered
+                ownsRenderedBitmap = true
+            }
 
-        // 5. Apply watermark if present
-        if (!watermarkText.isNullOrBlank()) {
-            val watermarked = drawWatermark(rendered, watermarkText)
-            if (ownsRendered && rendered !== watermarked && !rendered.isRecycled) rendered.recycle()
-            rendered = watermarked
-            ownsRendered = true
-        }
-
-        return if (!ownsRendered || rendered === originalBitmap || rendered === croppedBitmap) {
-            rendered.copy(rendered.config ?: Bitmap.Config.ARGB_8888, false)
-        } else {
-            rendered
+            return if (!ownsRendered || rendered === originalBitmap || rendered === croppedBitmap) {
+                rendered.copy(rendered.config ?: Bitmap.Config.ARGB_8888, false)
+            } else {
+                // Ownership is transferred to the caller; the failure cleanup below must not run.
+                ownsRenderedBitmap = false
+                rendered
+            }
+        } catch (error: Throwable) {
+            val ownedRendered = renderedBitmap
+            if (ownsRenderedBitmap && ownedRendered != null && !ownedRendered.isRecycled) {
+                ownedRendered.recycle()
+            } else if (ownsWorkingBitmap && !workingBitmap.isRecycled) {
+                workingBitmap.recycle()
+            }
+            throw error
         }
     }
 
@@ -185,6 +230,8 @@ enum class ScanMode(val title: String) {
     OCR_TEXT("OCR Teks")
 }
 
+private const val MAX_SCANNER_SESSION_PAGES = 100
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ScannerScreen(
@@ -198,9 +245,9 @@ fun ScannerScreen(
         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     }
 
-    val repository = remember { DocumentRepository(context) }
     val converter = remember { PdfConverterEngine(context) }
     val ocrEngine = remember { OcrEngine(context) }
+    val pdfRenderer = remember { PdfRendererEngine(context) }
 
     // Camera permission state
     var hasCameraPermission by remember {
@@ -223,6 +270,11 @@ fun ScannerScreen(
 
     // Scanned Pages in Current Session
     val scannedPages = remember { mutableStateListOf<ScannedPageItem>() }
+    // Reserve most of the heap for Compose, CameraX, filters, OCR, and transient output copies.
+    // Four ARGB bytes per retained pixel means maxMemory/10 keeps originals near 40% of the heap.
+    val maximumSessionPixels = remember {
+        (Runtime.getRuntime().maxMemory() / 10L).coerceIn(10_000_000L, 40_000_000L)
+    }
 
     // Navigation & UI States
     var isReviewMode by remember { mutableStateOf(false) }
@@ -249,20 +301,22 @@ fun ScannerScreen(
     var boundCamera: Camera? by remember { mutableStateOf(null) }
     var previewViewInstance: PreviewView? by remember { mutableStateOf(null) }
     var cameraProviderInstance: ProcessCameraProvider? by remember { mutableStateOf(null) }
+    var cameraErrorMessage by remember { mutableStateOf<String?>(null) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
     DisposableEffect(Unit) {
         onDispose {
-            try {
-                cameraProviderInstance?.unbindAll()
-                cameraExecutor.shutdown()
-                scannedPages.forEach { page ->
-                    page.croppedBitmap?.let { if (!it.isRecycled) it.recycle() }
-                    if (!page.originalBitmap.isRecycled) page.originalBitmap.recycle()
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+            runCatching { cameraProviderInstance?.unbindAll() }
+                .onFailure { Log.w("DokuPdfCamera", "Gagal melepas CameraX", it) }
+            cameraExecutor.shutdown()
+            runCatching { converter.close() }
+                .onFailure { Log.w("DokuPdfScanner", "Gagal menutup converter", it) }
+            runCatching { ocrEngine.close() }
+                .onFailure { Log.w("DokuPdfScanner", "Gagal menutup OCR", it) }
+            // Never recycle a Bitmap that has been published to Compose. ImageBitmap.asImageBitmap()
+            // shares the same pixel storage and the hardware renderer may still replay a recorded
+            // display list after this composable leaves the tree. Dropping the state references lets
+            // Android reclaim the bitmaps safely without a use-after-recycle crash.
         }
     }
 
@@ -271,48 +325,169 @@ fun ScannerScreen(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         if (uris.isNotEmpty()) {
+            val importMode = selectedScanMode
             scope.launch(Dispatchers.IO) {
+                var skippedImages = 0
                 for (uri in uris) {
+                    var decodedBitmap: Bitmap? = null
+                    var ownershipTransferred = false
                     try {
                         val bmp = decodeUriBitmap(context, uri)
+                        decodedBitmap = bmp
                         if (bmp != null) {
-                            val page = createAutoCroppedPage(bmp, selectedScanMode)
+                            val page = createAutoCroppedPage(bmp, importMode)
                             withContext(Dispatchers.Main) {
-                                scannedPages.add(
-                                    page
-                                )
+                                val retainedPixels = scannedPages.sumOf { retained ->
+                                    retained.originalBitmap.width.toLong() * retained.originalBitmap.height.toLong()
+                                }
+                                val addedPixels = bmp.width.toLong() * bmp.height.toLong()
+                                require(scannedPages.size < MAX_SCANNER_SESSION_PAGES) {
+                                    "Sesi scanner mencapai batas $MAX_SCANNER_SESSION_PAGES halaman"
+                                }
+                                require(retainedPixels + addedPixels <= maximumSessionPixels) {
+                                    "Batas memori sesi tercapai; simpan PDF saat ini sebelum menambah gambar"
+                                }
+                                scannedPages.add(page)
+                                ownershipTransferred = true
                             }
+                        } else {
+                            skippedImages++
                         }
                     } catch (e: Exception) {
-                        e.printStackTrace()
+                        skippedImages++
+                        Log.e("DokuPdfGallery", "Gambar galeri dilewati", e)
+                    } catch (_: OutOfMemoryError) {
+                        // The successfully imported pages remain usable; only this URI is skipped.
+                        skippedImages++
+                    } finally {
+                        if (!ownershipTransferred) {
+                            decodedBitmap?.let { bitmap ->
+                                if (!bitmap.isRecycled) bitmap.recycle()
+                            }
+                        }
                     }
                 }
                 withContext(Dispatchers.Main) {
                     if (scannedPages.isNotEmpty()) {
                         isReviewMode = true
                     }
+                    if (skippedImages > 0) {
+                        Toast.makeText(
+                            context,
+                            "$skippedImages gambar dilewati karena format tidak valid atau batas memori sesi tercapai.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                 }
             }
         }
     }
 
-    // PDF / File Picker
+    // PDF picker: render actual PDF pages instead of sending PDF bytes to BitmapFactory.
     val fileLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) {
+            val existingPageCount = scannedPages.size
+            val existingPixels = scannedPages.sumOf { page ->
+                page.originalBitmap.width.toLong() * page.originalBitmap.height.toLong()
+            }
             scope.launch(Dispatchers.IO) {
+                var temporaryPdf: File? = null
+                var renderedPages: List<Bitmap> = emptyList()
+                var ownershipTransferred = false
                 try {
-                    val bmp = decodeUriBitmap(context, uri)
-                    if (bmp != null) {
-                        val page = createAutoCroppedPage(bmp, selectedScanMode)
-                        withContext(Dispatchers.Main) {
-                            scannedPages.add(page)
-                            isReviewMode = true
+                    val inputFile = PdfFileUtils.uniqueFile(
+                        context.cacheDir,
+                        "scanner_pdf_${System.currentTimeMillis()}",
+                        "pdf"
+                    )
+                    temporaryPdf = inputFile
+                    val input = requireNotNull(context.contentResolver.openInputStream(uri)) {
+                        "Berkas PDF tidak dapat dibuka"
+                    }
+                    input.use { source ->
+                        inputFile.outputStream().use { output ->
+                            val buffer = ByteArray(32 * 1024)
+                            var copied = 0L
+                            while (true) {
+                                val read = source.read(buffer)
+                                if (read < 0) break
+                                copied += read
+                                require(copied <= PdfFileUtils.MAX_PDF_INPUT_BYTES) {
+                                    "PDF melebihi batas ${PdfFileUtils.formatBytes(PdfFileUtils.MAX_PDF_INPUT_BYTES)}"
+                                }
+                                output.write(buffer, 0, read)
+                            }
                         }
                     }
+                    PdfFileUtils.requirePdf(inputFile)
+                    val dimensions = pdfRenderer.getPageDimensions(inputFile)
+                    require(dimensions.isNotEmpty()) { "PDF tidak mempunyai halaman yang dapat dibaca" }
+                    require(existingPageCount + dimensions.size <= MAX_SCANNER_SESSION_PAGES) {
+                        "Jumlah halaman melebihi batas sesi $MAX_SCANNER_SESSION_PAGES halaman"
+                    }
+                    val totalPixels = dimensions.sumOf {
+                        it.width.toDouble() * it.height.toDouble()
+                    }.coerceAtLeast(1.0)
+                    val importedPixelBudget = (maximumSessionPixels - existingPixels)
+                        .coerceAtMost(12_000_000L)
+                    require(importedPixelBudget >= 1_000_000L) {
+                        "Sesi scanner sudah terlalu besar; simpan PDF saat ini sebelum mengimpor dokumen lain"
+                    }
+                    val requiredScale = kotlin.math.sqrt(importedPixelBudget / totalPixels).toFloat()
+                    require(requiredScale >= 0.05f) {
+                        "PDF memiliki terlalu banyak halaman untuk satu sesi scanner; pisahkan PDF terlebih dahulu"
+                    }
+                    val renderScale = requiredScale.coerceIn(0.05f, 1.6f)
+                    renderedPages = pdfRenderer.renderPdfPages(inputFile, renderScale)
+                    require(renderedPages.size == dimensions.size) { "Tidak semua halaman PDF berhasil dirender" }
+                    val importedPages = renderedPages.map { bitmap ->
+                        ScannedPageItem(
+                            originalBitmap = bitmap,
+                            cropGeometry = AutoCropDetector.fullGeometry(),
+                            filterType = FilterType.ORIGINAL
+                        )
+                    }
+                    withContext(Dispatchers.Main) {
+                        val currentPixels = scannedPages.sumOf { page ->
+                            page.originalBitmap.width.toLong() * page.originalBitmap.height.toLong()
+                        }
+                        val addedPixels = renderedPages.sumOf { bitmap ->
+                            bitmap.width.toLong() * bitmap.height.toLong()
+                        }
+                        require(scannedPages.size + importedPages.size <= MAX_SCANNER_SESSION_PAGES) {
+                            "Jumlah halaman melebihi batas sesi $MAX_SCANNER_SESSION_PAGES halaman"
+                        }
+                        require(currentPixels + addedPixels <= maximumSessionPixels) {
+                            "Batas memori sesi tercapai; simpan PDF saat ini sebelum mengimpor lagi"
+                        }
+                        scannedPages.addAll(importedPages)
+                        ownershipTransferred = true
+                        isReviewMode = true
+                    }
+                } catch (_: OutOfMemoryError) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            context,
+                            "Memori tidak cukup untuk mengimpor semua halaman PDF.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.e("DokuPdfImport", "Impor PDF gagal", e)
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            context,
+                            "Gagal mengimpor PDF: ${e.message ?: "berkas tidak valid"}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } finally {
+                    if (!ownershipTransferred) {
+                        renderedPages.forEach { bitmap -> if (!bitmap.isRecycled) bitmap.recycle() }
+                    }
+                    temporaryPdf?.delete()
                 }
             }
         }
@@ -324,7 +499,9 @@ fun ScannerScreen(
         }
     }
 
-    if (!hasCameraPermission) {
+    // Camera permission is only required for the live viewfinder. Gallery imports must remain
+    // reviewable/editable even when the user deliberately denies camera access.
+    if (!hasCameraPermission && !(isReviewMode && scannedPages.isNotEmpty())) {
         // Permission Request UI
         Surface(
             modifier = Modifier.fillMaxSize(),
@@ -381,6 +558,19 @@ fun ScannerScreen(
                     Text("Impor dari Galeri")
                 }
                 Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { fileLauncher.launch("application/pdf") },
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                    modifier = Modifier
+                        .fillMaxWidth(0.75f)
+                        .height(48.dp)
+                ) {
+                    Icon(Icons.Default.PictureAsPdf, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Impor berkas PDF")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
                 TextButton(onClick = onBack) {
                     Text("Kembali ke Beranda", color = Slate400)
                 }
@@ -390,14 +580,15 @@ fun ScannerScreen(
     }
 
     // Interactive crop screen for an existing page in review.
-    if (cropTargetPageIndex != null && cropTargetPageIndex in scannedPages.indices) {
-        val targetPage = scannedPages[cropTargetPageIndex!!]
+    val activeCropPageIndex = cropTargetPageIndex
+    if (activeCropPageIndex != null && activeCropPageIndex in scannedPages.indices) {
+        val targetPage = scannedPages[activeCropPageIndex]
         InteractiveCropScreen(
             initialBitmap = targetPage.originalBitmap,
             initialGeometry = targetPage.cropGeometry,
             onBack = { cropTargetPageIndex = null },
             onCropConfirmed = { croppedBmp, geometry, rotatedBmp ->
-                val idx = cropTargetPageIndex!!
+                val idx = activeCropPageIndex
                 if (idx in scannedPages.indices) {
                     val previous = scannedPages[idx]
                     scannedPages[idx] = previous.copy(
@@ -407,10 +598,6 @@ fun ScannerScreen(
                         croppedBitmap = null
                     )
                     if (croppedBmp !== rotatedBmp && !croppedBmp.isRecycled) croppedBmp.recycle()
-                    previous.croppedBitmap?.let { if (it !== croppedBmp && !it.isRecycled) it.recycle() }
-                    if (previous.originalBitmap !== rotatedBmp && !previous.originalBitmap.isRecycled) {
-                        previous.originalBitmap.recycle()
-                    }
                 }
                 cropTargetPageIndex = null
             }
@@ -450,22 +637,38 @@ fun ScannerScreen(
                 }
             },
             onOpenWatermark = { index ->
-                activeWatermarkPageIndex = index
-                watermarkInputText = scannedPages[index].watermarkText ?: ""
-                showWatermarkDialog = true
+                if (index in scannedPages.indices) {
+                    activeWatermarkPageIndex = index
+                    watermarkInputText = scannedPages[index].watermarkText ?: ""
+                    showWatermarkDialog = true
+                }
             },
             onExtractOcr = { index ->
                 if (index in scannedPages.indices) {
                     scope.launch(Dispatchers.IO) {
-                        val rendered = scannedPages[index].getRenderedBitmap()
+                        var rendered: Bitmap? = null
                         try {
-                            val text = ocrEngine.extractTextFromBitmap(rendered)
+                            rendered = scannedPages[index].getRenderedBitmap()
+                            val text = ocrEngine.extractTextFromBitmap(requireNotNull(rendered))
+                            require(text.isNotBlank()) { "Tidak ada teks yang terdeteksi pada halaman ini" }
                             withContext(Dispatchers.Main) {
                                 ocrDialogText = text
                                 showOcrDialog = true
                             }
+                        } catch (error: Exception) {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(
+                                    context,
+                                    "OCR gagal: ${error.message ?: "halaman tidak dapat diproses"}",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
+                        } catch (_: OutOfMemoryError) {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "Memori tidak cukup untuk OCR halaman ini.", Toast.LENGTH_LONG).show()
+                            }
                         } finally {
-                            if (!rendered.isRecycled) rendered.recycle()
+                            rendered?.let { if (!it.isRecycled) it.recycle() }
                         }
                     }
                 }
@@ -473,21 +676,22 @@ fun ScannerScreen(
             onSavePdf = {
                 scope.launch {
                     isSavingPdf = true
-                    val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                    val fileName = "Scan_Doc_$timeStamp.pdf"
-                    val docsDir = File(context.filesDir, "documents").apply { mkdirs() }
-                    val destFile = File(docsDir, fileName)
-                    var renderedBitmaps: List<Bitmap> = emptyList()
-
                     try {
-                        renderedBitmaps = withContext(Dispatchers.Default) {
-                            scannedPages.map { it.getRenderedBitmap() }
+                        val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                        val docsDir = File(context.filesDir, "documents").apply {
+                            require(exists() || mkdirs()) { "Direktori dokumen tidak dapat dibuat" }
+                        }
+                        val destFile = PdfFileUtils.uniqueFile(docsDir, "Scan_Doc_$timeStamp", "pdf")
+                        val pagesSnapshot = scannedPages.toList()
+                        require(pagesSnapshot.isNotEmpty()) { "Tidak ada halaman yang akan disimpan" }
+                        val result = converter.generatedBitmapsToPdf(
+                            pageCount = pagesSnapshot.size,
+                            outputPdf = destFile
+                        ) { pageIndex ->
+                            pagesSnapshot[pageIndex].getRenderedBitmap()
                         }
 
-                        val result = converter.bitmapsToPdf(renderedBitmaps, destFile, recycleSource = false)
-
                         if (result.isSuccess) {
-                            repository.refreshDocuments()
                             savedPdfFile = destFile
                         } else {
                             Toast.makeText(context, "Gagal membuat PDF: ${result.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
@@ -495,11 +699,16 @@ fun ScannerScreen(
                     } catch (oom: OutOfMemoryError) {
                         Toast.makeText(
                             context,
-                            "Memori tidak cukup untuk menyimpan PDF. Coba kurangi jumlah halaman per sesi atau matikan mode kualitas HD.",
+                                "Memori tidak cukup untuk menyimpan PDF. Coba kurangi jumlah halaman per sesi atau matikan mode kualitas HD.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                    } catch (error: Exception) {
+                        Toast.makeText(
+                            context,
+                            "Gagal menyimpan PDF: ${error.message ?: "penyimpanan tidak tersedia"}",
                             Toast.LENGTH_LONG
                         ).show()
                     } finally {
-                        renderedBitmaps.forEach { if (!it.isRecycled) it.recycle() }
                         isSavingPdf = false
                     }
                 }
@@ -583,8 +792,13 @@ fun ScannerScreen(
                             )
                             cameraControl = cam.cameraControl
                             boundCamera = cam
+                            cameraErrorMessage = null
                         } catch (exc: Exception) {
-                            exc.printStackTrace()
+                            Log.e("DokuPdfCamera", "Kamera tidak dapat dibuka", exc)
+                            imageCapture = null
+                            cameraControl = null
+                            boundCamera = null
+                            cameraErrorMessage = exc.message ?: "Kamera belakang tidak tersedia"
                         }
                     }, ContextCompat.getMainExecutor(ctx))
 
@@ -594,6 +808,38 @@ fun ScannerScreen(
 
             // Document Viewfinder Framing Overlay
             DocumentFrameOverlay(showGrid = showGrid)
+
+            cameraErrorMessage?.let { message ->
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .padding(horizontal = 28.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    color = Slate900.copy(alpha = 0.94f),
+                    tonalElevation = 6.dp
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(Icons.Default.NoPhotography, contentDescription = null, tint = AccentAmber)
+                        Text("Kamera tidak tersedia", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(
+                            message,
+                            color = Slate300,
+                            style = MaterialTheme.typography.bodySmall,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        )
+                        Button(onClick = { galleryLauncher.launch("image/*") }) {
+                            Text("Impor dari Galeri")
+                        }
+                        OutlinedButton(onClick = { fileLauncher.launch("application/pdf") }) {
+                            Text("Impor PDF")
+                        }
+                    }
+                }
+            }
 
             // Top Bar Overlay
             Row(
@@ -781,45 +1027,90 @@ fun ScannerScreen(
                             .size(76.dp)
                             .clip(CircleShape)
                             .background(Color(0xFF06B6D4).copy(alpha = 0.35f))
-                            .clickable(enabled = !isCapturing) {
+                            .clickable(enabled = !isCapturing && imageCapture != null) {
                                 val capture = imageCapture ?: return@clickable
+                                val captureMode = selectedScanMode
                                 isCapturing = true
 
                                 capture.takePicture(
                                     cameraExecutor,
                                     object : ImageCapture.OnImageCapturedCallback() {
                                         override fun onCaptureSuccess(imageProxy: ImageProxy) {
-                                            val bmp = imageProxyToBitmap(
-                                                imageProxy,
-                                                maxDimension = if (isHdQuality) 3200 else 1800
-                                            )
-                                            imageProxy.close()
+                                            val bmp = try {
+                                                imageProxyToBitmap(
+                                                    imageProxy,
+                                                    maxDimension = if (isHdQuality) 2600 else 1600
+                                                )
+                                            } finally {
+                                                imageProxy.close()
+                                            }
 
                                             scope.launch(Dispatchers.Default) {
-                                                if (bmp != null) {
-                                                    val page = createAutoCroppedPage(bmp, selectedScanMode)
+                                                var ownershipTransferred = false
+                                                try {
+                                                    if (bmp == null) {
+                                                        withContext(Dispatchers.Main) {
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Gagal memproses foto (memori tidak cukup). Coba tutup aplikasi lain lalu ulangi.",
+                                                                Toast.LENGTH_SHORT
+                                                            ).show()
+                                                        }
+                                                        return@launch
+                                                    }
+                                                    val page = createAutoCroppedPage(bmp, captureMode)
                                                     withContext(Dispatchers.Main) {
-                                                        scannedPages.add(page)
-                                                        isCapturing = false
-                                                        if (selectedScanMode == ScanMode.SINGLE_PAGE) {
-                                                            isReviewMode = true
+                                                        val retainedPixels = scannedPages.sumOf { retained ->
+                                                            retained.originalBitmap.width.toLong() * retained.originalBitmap.height.toLong()
+                                                        }
+                                                        val addedPixels = bmp.width.toLong() * bmp.height.toLong()
+                                                        if (
+                                                            scannedPages.size >= MAX_SCANNER_SESSION_PAGES ||
+                                                            retainedPixels + addedPixels > maximumSessionPixels
+                                                        ) {
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Batas memori sesi tercapai. Simpan PDF saat ini sebelum mengambil foto lagi.",
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        } else {
+                                                            scannedPages.add(page)
+                                                            ownershipTransferred = true
+                                                            if (captureMode == ScanMode.SINGLE_PAGE) {
+                                                                isReviewMode = true
+                                                            }
                                                         }
                                                     }
-                                                } else {
+                                                } catch (_: OutOfMemoryError) {
                                                     withContext(Dispatchers.Main) {
-                                                        isCapturing = false
                                                         Toast.makeText(
                                                             context,
-                                                            "Gagal memproses foto (memori tidak cukup). Coba tutup aplikasi lain lalu ulangi.",
-                                                            Toast.LENGTH_SHORT
+                                                            "Memori tidak cukup untuk menganalisis hasil foto.",
+                                                            Toast.LENGTH_LONG
                                                         ).show()
                                                     }
+                                                } catch (error: Exception) {
+                                                    Log.e("DokuPdfCamera", "Hasil foto gagal dianalisis", error)
+                                                    withContext(Dispatchers.Main) {
+                                                        Toast.makeText(
+                                                            context,
+                                                            "Gagal menganalisis hasil foto: ${error.message ?: "format tidak didukung"}",
+                                                            Toast.LENGTH_LONG
+                                                        ).show()
+                                                    }
+                                                } finally {
+                                                    if (!ownershipTransferred) {
+                                                        bmp?.let { bitmap ->
+                                                            if (!bitmap.isRecycled) bitmap.recycle()
+                                                        }
+                                                    }
+                                                    withContext(Dispatchers.Main) { isCapturing = false }
                                                 }
                                             }
                                         }
 
                                         override fun onError(exception: ImageCaptureException) {
-                                            exception.printStackTrace()
+                                            Log.e("DokuPdfCamera", "Pengambilan gambar gagal", exception)
                                             scope.launch(Dispatchers.Main) {
                                                 isCapturing = false
                                                 Toast.makeText(context, "Gagal mengambil foto: ${exception.message}", Toast.LENGTH_SHORT).show()
@@ -930,11 +1221,11 @@ fun ScannerScreen(
 
                 val features = listOf(
                     Triple(Icons.Default.DocumentScanner, "Pindai Dokumen", "Pindai dokumen teks, surat, atau nota."),
-                    Triple(Icons.Default.CreditCard, "Kartu ID / KTP", "Gabungkan foto depan dan belakang kartu ID."),
-                    Triple(Icons.AutoMirrored.Filled.MenuBook, "Buku / Majalah", "Otomatis pisahkan halaman kiri & kanan."),
-                    Triple(Icons.Default.AutoFixHigh, "Hapus Bayangan Cerdas", "Hilangkan bayangan jari & lipatan kertas."),
-                    Triple(Icons.Default.FontDownload, "Ekstrak Teks (OCR)", "Ekstrak teks gambar ke dokumen yang dapat diedit."),
-                    Triple(Icons.AutoMirrored.Filled.InsertDriveFile, "Impor Berkas PDF", "Impor dokumen PDF dan lakukan peningkatan kualitas.")
+                    Triple(Icons.Default.CreditCard, "Kartu ID / KTP", "Pertahankan warna kartu; pindai sisi depan dan belakang sebagai halaman terpisah."),
+                    Triple(Icons.AutoMirrored.Filled.MenuBook, "Pindai Batch", "Ambil beberapa halaman buku atau majalah dalam satu sesi."),
+                    Triple(Icons.Default.AutoFixHigh, "Kurangi Bayangan", "Optimalkan pencahayaan dan kontras kertas secara otomatis."),
+                    Triple(Icons.Default.FontDownload, "Ekstrak Teks (OCR)", "Gunakan filter teks lalu ekstrak OCR dari layar review."),
+                    Triple(Icons.AutoMirrored.Filled.InsertDriveFile, "Impor Berkas PDF", "Render seluruh halaman PDF ke sesi review dengan batas memori aman.")
                 )
 
                 features.forEach { (icon, title, desc) ->
@@ -1028,6 +1319,49 @@ fun ScannerScreen(
         )
     }
 
+    // Per-page scanner watermark editor. This state previously had no rendered dialog,
+    // leaving the visible "Tandai" action as a no-op.
+    if (showWatermarkDialog) {
+        AlertDialog(
+            onDismissRequest = { showWatermarkDialog = false },
+            title = { Text("Tanda Air Halaman", style = MaterialTheme.typography.titleMedium) },
+            text = {
+                OutlinedTextField(
+                    value = watermarkInputText,
+                    onValueChange = { if (it.length <= 200) watermarkInputText = it },
+                    label = { Text("Teks tanda air") },
+                    supportingText = { Text("Maksimal 200 karakter; kosongkan untuk menghapus.") },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("scanner_watermark_input")
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val pageIndex = activeWatermarkPageIndex
+                        if (pageIndex in scannedPages.indices) {
+                            scannedPages[pageIndex] = scannedPages[pageIndex].copy(
+                                watermarkText = watermarkInputText.trim().takeIf { it.isNotEmpty() }
+                            )
+                        }
+                        showWatermarkDialog = false
+                    },
+                    enabled = activeWatermarkPageIndex in scannedPages.indices,
+                    modifier = Modifier.testTag("scanner_watermark_apply")
+                ) {
+                    Text("Terapkan")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showWatermarkDialog = false }) {
+                    Text("Batal")
+                }
+            }
+        )
+    }
+
     // PDF Saved Success Dialog
     savedPdfFile?.let { file ->
         AlertDialog(
@@ -1058,7 +1392,7 @@ fun ScannerScreen(
                         onScanSaved()
                     }
                 ) {
-                    Text("Selesai & Buka")
+                    Text("Selesai")
                 }
             },
             dismissButton = {
@@ -1155,6 +1489,18 @@ fun MultiPageReviewScreen(
     val currentPage = pages.getOrNull(currentPageIndex)
     var isComparingOriginal by remember { mutableStateOf(false) }
     var showAdjustments by remember { mutableStateOf(false) }
+    var pendingDeletePage by remember { mutableStateOf<Int?>(null) }
+
+    LaunchedEffect(pages.size) {
+        val lastPageIndex = pages.lastIndex
+        if (lastPageIndex >= 0 && pagerState.currentPage > lastPageIndex) {
+            pagerState.scrollToPage(lastPageIndex)
+        }
+    }
+
+    LaunchedEffect(pagerState.currentPage) {
+        isComparingOriginal = false
+    }
 
     Scaffold(
         topBar = {
@@ -1184,7 +1530,7 @@ fun MultiPageReviewScreen(
                     IconButton(onClick = { onRotatePage(currentPageIndex, 90) }) {
                         Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Putar 90°", tint = Slate700)
                     }
-                    IconButton(onClick = { onDeletePage(currentPageIndex) }) {
+                    IconButton(onClick = { pendingDeletePage = currentPageIndex }) {
                         Icon(Icons.Default.DeleteOutline, contentDescription = "Hapus Halaman", tint = Color(0xFFEF4444))
                     }
                 },
@@ -1425,12 +1771,15 @@ fun MultiPageReviewScreen(
                         pageItem.watermarkText
                     ) {
                         value = withContext(Dispatchers.Default) {
-                            pageItem.getRenderedBitmap(maxDimension = 1600)
-                        }
-                    }
-                    DisposableEffect(rendered) {
-                        onDispose {
-                            rendered?.let { if (!it.isRecycled) it.recycle() }
+                            try {
+                                pageItem.getRenderedBitmap(maxDimension = 1600)
+                            } catch (oom: OutOfMemoryError) {
+                                Log.e("DokuPdfPreview", "Memori tidak cukup untuk preview halaman ${pageIdx + 1}", oom)
+                                pageItem.originalBitmap
+                            } catch (error: Exception) {
+                                Log.e("DokuPdfPreview", "Preview halaman ${pageIdx + 1} gagal", error)
+                                pageItem.originalBitmap
+                            }
                         }
                     }
 
@@ -1554,6 +1903,30 @@ fun MultiPageReviewScreen(
             }
         }
     }
+
+    pendingDeletePage?.let { pageIndex ->
+        AlertDialog(
+            onDismissRequest = { pendingDeletePage = null },
+            title = { Text("Hapus halaman?") },
+            text = { Text("Halaman ${pageIndex + 1} akan dihapus dari sesi pindai ini.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingDeletePage = null
+                        if (pageIndex in pages.indices) onDeletePage(pageIndex)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                ) {
+                    Text("Hapus")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDeletePage = null }) {
+                    Text("Batal")
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -1606,6 +1979,7 @@ private fun createAutoCroppedPage(bitmap: Bitmap, mode: ScanMode): ScannedPageIt
 }
 
 private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = 2600): Bitmap? {
+    var decodedBitmap: Bitmap? = null
     return try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         context.contentResolver.openInputStream(uri)?.use {
@@ -1621,13 +1995,52 @@ private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = 2600
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
         }
-        context.contentResolver.openInputStream(uri)?.use {
+        val decoded = context.contentResolver.openInputStream(uri)?.use {
             BitmapFactory.decodeStream(it, null, options)
+        } ?: return null
+        decodedBitmap = decoded
+
+        val orientation = try {
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                ExifInterface(input).getAttributeInt(
+                    ExifInterface.TAG_ORIENTATION,
+                    ExifInterface.ORIENTATION_NORMAL
+                )
+            } ?: ExifInterface.ORIENTATION_NORMAL
+        } catch (_: Exception) {
+            ExifInterface.ORIENTATION_NORMAL
         }
+        val orientationMatrix = when (orientation) {
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> Matrix().apply { setScale(-1f, 1f) }
+            ExifInterface.ORIENTATION_ROTATE_180 -> Matrix().apply { setRotate(180f) }
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> Matrix().apply {
+                setRotate(180f)
+                postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSPOSE -> Matrix().apply {
+                setRotate(90f)
+                postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> Matrix().apply { setRotate(90f) }
+            ExifInterface.ORIENTATION_TRANSVERSE -> Matrix().apply {
+                setRotate(-90f)
+                postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> Matrix().apply { setRotate(270f) }
+            else -> null
+        }
+        val oriented = orientationMatrix?.let { matrix ->
+            Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+        } ?: decoded
+        if (oriented !== decoded && !decoded.isRecycled) decoded.recycle()
+        decodedBitmap = null
+        oriented
     } catch (_: OutOfMemoryError) {
+        decodedBitmap?.let { if (!it.isRecycled) it.recycle() }
         null
     } catch (error: Exception) {
-        error.printStackTrace()
+        decodedBitmap?.let { if (!it.isRecycled) it.recycle() }
+        Log.e("DokuPdfGallery", "Decode gambar galeri gagal", error)
         null
     }
 }
@@ -1685,7 +2098,7 @@ private fun imageProxyToBitmap(imageProxy: ImageProxy, maxDimension: Int = 2600)
     } catch (_: OutOfMemoryError) {
         null
     } catch (e: Exception) {
-        e.printStackTrace()
+        Log.e("DokuPdfCamera", "Konversi ImageProxy gagal", e)
         null
     }
 }

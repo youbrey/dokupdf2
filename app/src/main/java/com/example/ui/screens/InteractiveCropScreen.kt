@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
@@ -79,13 +80,13 @@ fun InteractiveCropScreen(
     onBack: () -> Unit,
     onCropConfirmed: (croppedBitmap: Bitmap, geometry: CropGeometry, rotatedBitmap: Bitmap) -> Unit
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var workingBitmap by remember { mutableStateOf(initialBitmap) }
     var cropGeometry by remember {
         mutableStateOf(initialGeometry ?: AutoCropDetector.defaultGeometry())
     }
     var isProcessing by remember { mutableStateOf(initialGeometry == null) }
-    var bitmapHandedOff by remember { mutableStateOf(false) }
 
     var activeHandle by remember { mutableStateOf(HandleType.NONE) }
     var displayedImageBounds by remember { mutableStateOf(Rect.Zero) }
@@ -114,10 +115,16 @@ fun InteractiveCropScreen(
                     Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
                 }
                 workingBitmap = rotated
-                if (source !== initialBitmap && source !== rotated && !source.isRecycled) source.recycle()
                 cropGeometry = withContext(Dispatchers.Default) {
                     detectCropGeometry(rotated, "Interactive crop rotation")
                 }
+            } catch (oom: OutOfMemoryError) {
+                Log.e("DokuPdfCrop", "Memori tidak cukup untuk memutar crop", oom)
+                android.widget.Toast.makeText(
+                    context,
+                    "Memori tidak cukup untuk memutar gambar ini.",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
             } finally {
                 isProcessing = false
             }
@@ -126,14 +133,6 @@ fun InteractiveCropScreen(
 
     LaunchedEffect(initialBitmap, initialGeometry) {
         if (initialGeometry == null) detectEdges(initialBitmap)
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            if (!bitmapHandedOff && workingBitmap !== initialBitmap && !workingBitmap.isRecycled) {
-                workingBitmap.recycle()
-            }
-        }
     }
 
     Scaffold(
@@ -222,11 +221,24 @@ fun InteractiveCropScreen(
                                     val cropped = withContext(Dispatchers.Default) {
                                         FilterProcessor.cropPerspective(workingBitmap, cropGeometry)
                                     }
-                                    bitmapHandedOff = true
                                     isProcessing = false
                                     onCropConfirmed(cropped, cropGeometry, workingBitmap)
+                                } catch (oom: OutOfMemoryError) {
+                                    Log.e("DokuPdfCrop", "Memori tidak cukup untuk crop perspektif", oom)
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Memori tidak cukup untuk memotong gambar ini.",
+                                        android.widget.Toast.LENGTH_LONG
+                                    ).show()
+                                } catch (error: Exception) {
+                                    Log.e("DokuPdfCrop", "Crop perspektif gagal", error)
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Gagal memotong gambar: ${error.message ?: "geometri tidak valid"}",
+                                        android.widget.Toast.LENGTH_LONG
+                                    ).show()
                                 } finally {
-                                    if (!bitmapHandedOff) isProcessing = false
+                                    isProcessing = false
                                 }
                             }
                         },

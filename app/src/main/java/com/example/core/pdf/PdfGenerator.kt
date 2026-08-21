@@ -12,19 +12,32 @@ import java.io.FileOutputStream
 /**
  * Generates standards-compliant PDF documents from DocumentModel state
  */
-class PdfGenerator(private val context: Context) {
+class PdfGenerator(@Suppress("UNUSED_PARAMETER") context: Context) {
+
+    private data class StyledFragment(val text: String, val run: TextRun)
 
     suspend fun exportToPdf(
         document: DocumentModel,
         outputFile: File,
         quality: Float = 1.0f
     ): Result<File> = withContext(Dispatchers.IO) {
-        val pdfDoc = PdfDocument()
         try {
-            for ((index, page) in document.pages.withIndex()) {
+            require(document.pages.isNotEmpty()) { "Dokumen tidak memiliki halaman" }
+            require(quality.isFinite() && quality in 0.5f..2f) { "Kualitas PDF harus berada pada rentang 0.5-2.0" }
+
+            PdfFileUtils.writeAtomically(outputFile, minimumBytes = 5L) { temporaryOutput ->
+                val pdfDoc = PdfDocument()
+                try {
+                    for ((index, page) in document.pages.withIndex()) {
+                require(
+                    page.width.isFinite() && page.height.isFinite() &&
+                        page.width in 1f..20_000f && page.height in 1f..20_000f
+                ) {
+                    "Ukuran halaman ${index + 1} tidak valid"
+                }
                 val pageInfo = PdfDocument.PageInfo.Builder(
-                    page.width.toInt().coerceAtLeast(100),
-                    page.height.toInt().coerceAtLeast(100),
+                    page.width.toInt().coerceAtLeast(1),
+                    page.height.toInt().coerceAtLeast(1),
                     index + 1
                 ).create()
 
@@ -37,35 +50,55 @@ class PdfGenerator(private val context: Context) {
                 // 1. Draw Page Bitmap if available
                 val rawBitmap = page.processedBitmap ?: page.originalBitmap
                 if (rawBitmap != null && !rawBitmap.isRecycled) {
-                    val bitmap = if (rawBitmap.width > 1600 || rawBitmap.height > 1600) {
-                        val maxDim = 1600f
-                        val longest = maxOf(rawBitmap.width, rawBitmap.height).toFloat()
-                        val scale = maxDim / longest
-                        Bitmap.createScaledBitmap(
-                            rawBitmap,
-                            (rawBitmap.width * scale).toInt().coerceAtLeast(100),
-                            (rawBitmap.height * scale).toInt().coerceAtLeast(100),
-                            true
+                    var workingBitmap = rawBitmap
+                    var ownsWorkingBitmap = false
+                    try {
+                        if (page.rotationDegrees % 360 != 0) {
+                            val rotated = Bitmap.createBitmap(
+                                workingBitmap,
+                                0,
+                                0,
+                                workingBitmap.width,
+                                workingBitmap.height,
+                                Matrix().apply { postRotate(page.rotationDegrees.toFloat()) },
+                                true
+                            )
+                            workingBitmap = rotated
+                            ownsWorkingBitmap = rotated !== rawBitmap
+                        }
+
+                        val maximumDimension = 1600f * quality
+                        val longest = maxOf(workingBitmap.width, workingBitmap.height).toFloat()
+                        if (longest > maximumDimension) {
+                            val scale = maximumDimension / longest
+                            val scaled = Bitmap.createScaledBitmap(
+                                workingBitmap,
+                                (workingBitmap.width * scale).toInt().coerceAtLeast(1),
+                                (workingBitmap.height * scale).toInt().coerceAtLeast(1),
+                                true
+                            )
+                            if (ownsWorkingBitmap && workingBitmap !== scaled && !workingBitmap.isRecycled) {
+                                workingBitmap.recycle()
+                            }
+                            workingBitmap = scaled
+                            ownsWorkingBitmap = scaled !== rawBitmap
+                        }
+
+                        val fitScale = minOf(
+                            page.width / workingBitmap.width.toFloat(),
+                            page.height / workingBitmap.height.toFloat()
                         )
-                    } else rawBitmap
-
-                    val matrix = Matrix()
-                    if (page.rotationDegrees != 0) {
-                        matrix.postRotate(
-                            page.rotationDegrees.toFloat(),
-                            bitmap.width / 2f,
-                            bitmap.height / 2f
-                        )
-                    }
-                    val scaleX = page.width / bitmap.width.toFloat()
-                    val scaleY = page.height / bitmap.height.toFloat()
-                    matrix.postScale(scaleX, scaleY)
-
-                    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-                    canvas.drawBitmap(bitmap, matrix, paint)
-
-                    if (bitmap !== rawBitmap && !bitmap.isRecycled) {
-                        bitmap.recycle()
+                        val drawWidth = workingBitmap.width * fitScale
+                        val drawHeight = workingBitmap.height * fitScale
+                        val left = (page.width - drawWidth) / 2f
+                        val top = (page.height - drawHeight) / 2f
+                        val destination = RectF(left, top, left + drawWidth, top + drawHeight)
+                        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                        canvas.drawBitmap(workingBitmap, null, destination, paint)
+                    } finally {
+                        if (ownsWorkingBitmap && workingBitmap !== rawBitmap && !workingBitmap.isRecycled) {
+                            workingBitmap.recycle()
+                        }
                     }
                 }
 
@@ -74,17 +107,18 @@ class PdfGenerator(private val context: Context) {
 
                 // 3. Draw Smart Eraser Strokes
                 for (eraser in page.eraserStrokes) {
-                    if (eraser.points.size > 1) {
+                    val validPoints = eraser.points.filter { it.x.isFinite() && it.y.isFinite() }
+                    if (validPoints.size > 1) {
                         val path = android.graphics.Path()
-                        val first = eraser.points.first()
+                        val first = validPoints.first()
                         path.moveTo(first.x * page.width, first.y * page.height)
-                        for (pt in eraser.points.drop(1)) {
+                        for (pt in validPoints.drop(1)) {
                             path.lineTo(pt.x * page.width, pt.y * page.height)
                         }
                         val eraserPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                             color = Color.WHITE
                             style = Paint.Style.STROKE
-                            strokeWidth = eraser.strokeWidth
+                            strokeWidth = eraser.strokeWidth.coerceIn(1f, 200f)
                             strokeCap = Paint.Cap.ROUND
                             strokeJoin = Paint.Join.ROUND
                         }
@@ -94,18 +128,19 @@ class PdfGenerator(private val context: Context) {
 
                 // 4. Draw Pen & Highlight Annotations
                 for (drawPath in page.drawPaths) {
-                    if (drawPath.points.size > 1) {
+                    val validPoints = drawPath.points.filter { it.x.isFinite() && it.y.isFinite() }
+                    if (validPoints.size > 1) {
                         val path = android.graphics.Path()
-                        val first = drawPath.points.first()
+                        val first = validPoints.first()
                         path.moveTo(first.x * page.width, first.y * page.height)
-                        for (pt in drawPath.points.drop(1)) {
+                        for (pt in validPoints.drop(1)) {
                             path.lineTo(pt.x * page.width, pt.y * page.height)
                         }
                         val drawPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                            color = drawPath.color.toInt()
-                            if (drawPath.isHighlight) alpha = 100
+                            color = if (drawPath.isEraser) Color.WHITE else drawPath.color.toInt()
+                            if (drawPath.isHighlight && !drawPath.isEraser) alpha = 100
                             style = Paint.Style.STROKE
-                            strokeWidth = drawPath.strokeWidth
+                            strokeWidth = drawPath.strokeWidth.coerceIn(1f, 200f)
                             strokeCap = Paint.Cap.ROUND
                             strokeJoin = Paint.Join.ROUND
                         }
@@ -117,10 +152,12 @@ class PdfGenerator(private val context: Context) {
                 for (sig in page.signatures) {
                     val sigBitmap = sig.bitmap
                     if (sigBitmap != null && !sigBitmap.isRecycled) {
-                        val sigW = page.width * sig.widthFraction
-                        val sigH = page.height * sig.heightFraction
-                        val sigLeft = (page.width * sig.normalizedX) - (sigW / 2f)
-                        val sigTop = (page.height * sig.normalizedY) - (sigH / 2f)
+                        val sigW = page.width * sig.widthFraction.coerceIn(0.01f, 1f)
+                        val sigH = page.height * sig.heightFraction.coerceIn(0.01f, 1f)
+                        val centerX = page.width * sig.normalizedX.coerceIn(0f, 1f)
+                        val centerY = page.height * sig.normalizedY.coerceIn(0f, 1f)
+                        val sigLeft = (centerX - sigW / 2f).coerceIn(0f, page.width - sigW)
+                        val sigTop = (centerY - sigH / 2f).coerceIn(0f, page.height - sigH)
 
                         val src = Rect(0, 0, sigBitmap.width, sigBitmap.height)
                         val dst = RectF(sigLeft, sigTop, sigLeft + sigW, sigTop + sigH)
@@ -137,24 +174,25 @@ class PdfGenerator(private val context: Context) {
                 pdfDoc.finishPage(pdfPage)
             }
 
-            outputFile.parentFile?.mkdirs()
-            FileOutputStream(outputFile).use { out ->
-                pdfDoc.writeTo(out)
+                    FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
+                } finally {
+                    pdfDoc.close()
+                }
             }
 
             Result.success(outputFile)
         } catch (e: Exception) {
             Result.failure(e)
-        } finally {
-            pdfDoc.close()
+        } catch (oom: OutOfMemoryError) {
+            Result.failure(IllegalStateException("Memori tidak cukup untuk mengekspor dokumen ke PDF", oom))
         }
     }
 
     private fun drawWatermark(canvas: Canvas, wm: WatermarkAnnotation, width: Float, height: Float) {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.GRAY
+            color = wm.color.toInt()
             alpha = (wm.opacity * 255).toInt().coerceIn(0, 255)
-            textSize = wm.fontSize * 1.5f
+            textSize = wm.fontSize.coerceIn(8f, 160f)
             typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
             textAlign = Paint.Align.CENTER
         }
@@ -163,8 +201,8 @@ class PdfGenerator(private val context: Context) {
         if (wm.isTiled) {
             val stepX = width / 2f
             val stepY = height / 3f
-            for (r in 0..3) {
-                for (c in 0..2) {
+            for (r in 0 until 3) {
+                for (c in 0 until 2) {
                     canvas.save()
                     val px = c * stepX + (stepX / 2f)
                     val py = r * stepY + (stepY / 2f)
@@ -184,49 +222,197 @@ class PdfGenerator(private val context: Context) {
 
     private fun drawBlocks(canvas: Canvas, blocks: List<Block>, width: Float, height: Float) {
         var currentY = 48f
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.DKGRAY
-            textSize = 14f * 2.2f
-            typeface = Typeface.SANS_SERIF
-        }
+        val leftMargin = 48f
+        val rightMargin = 48f
+        val maximumWidth = (width - leftMargin - rightMargin).coerceAtLeast(1f)
 
         for (block in blocks) {
+            if (currentY >= height - 48f) break
             when (block) {
                 is Block.ParagraphBlock -> {
-                    val fullText = block.runs.joinToString("") { it.text }
-                    if (fullText.isNotBlank()) {
-                        canvas.drawText(fullText, 48f, currentY, textPaint)
-                        currentY += 36f
-                    }
+                    currentY = drawRichParagraph(
+                        canvas = canvas,
+                        block = block,
+                        startY = currentY,
+                        left = leftMargin,
+                        maximumWidth = maximumWidth,
+                        bottom = height - 48f
+                    )
                 }
                 is Block.TableBlock -> {
-                    val cellW = (width - 96f) / block.cols.coerceAtLeast(1)
+                    val rows = block.rows.coerceIn(1, 500)
+                    val columns = block.cols.coerceIn(1, 32)
+                    val cellW = maximumWidth / columns
                     val cellH = 36f
                     val borderPaint = Paint().apply {
                         color = Color.LTGRAY
                         style = Paint.Style.STROKE
                         strokeWidth = 1.5f
                     }
-                    for (r in 0 until block.rows) {
-                        for (c in 0 until block.cols) {
-                            val left = 48f + c * cellW
-                            val top = currentY + r * cellH
-                            canvas.drawRect(left, top, left + cellW, top + cellH, borderPaint)
+                    val cellPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                        color = Color.DKGRAY
+                        textSize = 10f
+                        typeface = Typeface.SANS_SERIF
+                    }
+                    var renderedRows = 0
+                    for (r in 0 until rows) {
+                        val top = currentY + r * cellH
+                        if (top + cellH > height - 48f) break
+                        for (c in 0 until columns) {
+                            val cellLeft = leftMargin + c * cellW
+                            canvas.drawRect(cellLeft, top, cellLeft + cellW, top + cellH, borderPaint)
                             val txt = block.cells.getOrNull(r)?.getOrNull(c) ?: ""
                             if (txt.isNotBlank()) {
-                                canvas.drawText(txt, left + 8f, top + 24f, textPaint)
+                                canvas.drawText(
+                                    ellipsize(txt.replace('\n', ' '), cellPaint, (cellW - 12f).coerceAtLeast(1f)),
+                                    cellLeft + 6f,
+                                    top + 23f,
+                                    cellPaint
+                                )
                             }
                         }
+                        renderedRows++
                     }
-                    currentY += (block.rows * cellH) + 32f
+                    currentY += (renderedRows * cellH) + 24f
                 }
                 is Block.ImageBlock -> {
-                    block.bitmap?.let { img ->
-                        canvas.drawBitmap(img, 48f, currentY, textPaint)
-                        currentY += img.height + 32f
+                    block.bitmap?.takeIf { !it.isRecycled && it.width > 0 && it.height > 0 }?.let { image ->
+                        val requestedWidth = block.width.takeIf { it.isFinite() && it > 0f } ?: image.width.toFloat()
+                        val requestedHeight = block.height.takeIf { it.isFinite() && it > 0f } ?: image.height.toFloat()
+                        val fitScale = minOf(
+                            1f,
+                            maximumWidth / requestedWidth,
+                            (height - 48f - currentY).coerceAtLeast(1f) / requestedHeight
+                        )
+                        val drawWidth = requestedWidth * fitScale
+                        val drawHeight = requestedHeight * fitScale
+                        val destination = RectF(
+                            leftMargin,
+                            currentY,
+                            leftMargin + drawWidth,
+                            currentY + drawHeight
+                        )
+                        canvas.drawBitmap(
+                            image,
+                            null,
+                            destination,
+                            Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                        )
+                        currentY += drawHeight + 24f
                     }
                 }
             }
         }
+    }
+
+    private fun drawRichParagraph(
+        canvas: Canvas,
+        block: Block.ParagraphBlock,
+        startY: Float,
+        left: Float,
+        maximumWidth: Float,
+        bottom: Float
+    ): Float {
+        val lines = mutableListOf<MutableList<StyledFragment>>(mutableListOf())
+        var currentLineWidth = 0f
+
+        fun startNewLine() {
+            if (lines.last().isNotEmpty()) lines.add(mutableListOf())
+            currentLineWidth = 0f
+        }
+
+        for (run in block.runs) {
+            val paint = paintFor(run)
+            val tokens = Regex("\\n|[^\\S\\n]+|[^\\s]+")
+                .findAll(run.text)
+                .map { it.value }
+            for (rawToken in tokens) {
+                if (rawToken == "\n") {
+                    startNewLine()
+                    continue
+                }
+                var token = rawToken
+                if (currentLineWidth == 0f && token.isBlank()) continue
+                while (token.isNotEmpty()) {
+                    val available = (maximumWidth - currentLineWidth).coerceAtLeast(1f)
+                    var count = paint.breakText(token, true, available, null)
+                    if (count <= 0 && lines.last().isNotEmpty()) {
+                        startNewLine()
+                        continue
+                    }
+                    count = count.coerceAtLeast(1)
+                    val piece = token.take(count)
+                    if (piece.isNotBlank() || lines.last().isNotEmpty()) {
+                        lines.last() += StyledFragment(piece, run)
+                        currentLineWidth += paint.measureText(piece)
+                    }
+                    token = token.drop(count)
+                    if (token.isNotEmpty()) startNewLine()
+                }
+            }
+        }
+
+        if (lines.lastOrNull()?.isEmpty() == true && lines.size > 1) lines.removeAt(lines.lastIndex)
+        var baseline = startY
+        for ((lineIndex, line) in lines.withIndex()) {
+            if (line.isEmpty()) {
+                baseline += 18f
+                continue
+            }
+            val lineHeight = line.maxOf { it.run.fontSize.coerceIn(8f, 72f) } * 1.35f
+            baseline += lineHeight
+            if (baseline > bottom) break
+            val measuredWidth = line.sumOf { fragment ->
+                paintFor(fragment.run).measureText(fragment.text).toDouble()
+            }.toFloat()
+            var x = when (block.alignment) {
+                1 -> left + (maximumWidth - measuredWidth) / 2f
+                2 -> left + maximumWidth - measuredWidth
+                else -> left
+            }.coerceAtLeast(left)
+            val expandableSpaces = line.count {
+                it.text.isNotEmpty() && it.text.all { character -> character.isWhitespace() }
+            }
+            val extraSpace = if (
+                block.alignment == 3 && lineIndex < lines.lastIndex && expandableSpaces > 0
+            ) {
+                ((maximumWidth - measuredWidth) / expandableSpaces).coerceAtLeast(0f)
+            } else {
+                0f
+            }
+            line.forEach { fragment ->
+                val paint = paintFor(fragment.run)
+                canvas.drawText(fragment.text, x, baseline, paint)
+                x += paint.measureText(fragment.text)
+                if (
+                    fragment.text.isNotEmpty() &&
+                    fragment.text.all { character -> character.isWhitespace() }
+                ) x += extraSpace
+            }
+        }
+        return (baseline + 18f).coerceAtMost(bottom)
+    }
+
+    private fun paintFor(run: TextRun): Paint {
+        val style = when {
+            run.isBold && run.isItalic -> Typeface.BOLD_ITALIC
+            run.isBold -> Typeface.BOLD
+            run.isItalic -> Typeface.ITALIC
+            else -> Typeface.NORMAL
+        }
+        return Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = run.color.toInt()
+            textSize = run.fontSize.coerceIn(8f, 72f)
+            typeface = Typeface.create(Typeface.SANS_SERIF, style)
+            isUnderlineText = run.isUnderline
+        }
+    }
+
+    private fun ellipsize(value: String, paint: Paint, maximumWidth: Float): String {
+        if (paint.measureText(value) <= maximumWidth) return value
+        val ellipsis = "…"
+        val available = (maximumWidth - paint.measureText(ellipsis)).coerceAtLeast(1f)
+        val count = paint.breakText(value, true, available, null).coerceAtLeast(0)
+        return value.take(count).trimEnd() + ellipsis
     }
 }

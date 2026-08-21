@@ -1,12 +1,15 @@
 package com.example.core.pdf
 
 import android.content.Context
+import android.graphics.Paint
+import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 
 data class RepairReport(
     val outputFile: File,
@@ -15,9 +18,10 @@ data class RepairReport(
 )
 
 class PdfRepairEngine(
-    private val context: Context,
+    context: Context,
     private val rendererEngine: PdfRendererEngine = PdfRendererEngine(context)
 ) {
+    private val cacheDir = context.applicationContext.cacheDir
 
     suspend fun repairPdf(
         sourcePdf: File,
@@ -26,68 +30,66 @@ class PdfRepairEngine(
         val fixedIssues = mutableListOf<String>()
         var tempFile: File? = null
         try {
-            require(sourcePdf.isFile && sourcePdf.length() > 0L) { "Berkas PDF sumber tidak valid" }
-            val bytes = FileInputStream(sourcePdf).use { it.readBytes() }
-            var rawText = String(bytes, Charsets.ISO_8859_1)
+            PdfFileUtils.requireReadableFile(sourcePdf, "Berkas PDF sumber")
+            PdfFileUtils.requireDistinct(sourcePdf, outputPdf)
+            val headerOffset = findPdfHeaderOffset(sourcePdf)
+            val hasTrailer = hasEofTrailer(sourcePdf)
 
-            // 1. Check & repair PDF Header (%PDF-1.7)
-            if (!rawText.startsWith("%PDF-")) {
-                val headerIndex = rawText.indexOf("%PDF-")
-                if (headerIndex > 0) {
-                    rawText = rawText.substring(headerIndex)
-                    fixedIssues.add("Memperbaiki header PDF yang bergeser")
-                } else {
-                    rawText = "%PDF-1.7\n$rawText"
-                    fixedIssues.add("Menambahkan header standar %PDF-1.7 yang hilang")
-                }
-            }
-
-            // 2. Check & repair %%EOF trailer marker
-            if (!rawText.trimEnd().endsWith("%%EOF")) {
-                rawText = rawText.trimEnd() + "\n%%EOF"
-                fixedIssues.add("Memperbaiki penutup stream file (%%EOF marker) yang rusak")
-            }
-
-            // 3. Re-rasterize pages through clean rendering pipeline to remove corrupt bytecode streams
-            val candidateFile = File(context.cacheDir, "repair_temp_${System.currentTimeMillis()}.pdf")
+            val candidateFile = File.createTempFile("repair_candidate_", ".pdf", cacheDir)
             tempFile = candidateFile
-            FileOutputStream(candidateFile).use { it.write(rawText.toByteArray(Charsets.ISO_8859_1)) }
-
-            val repairedCandidatePages = try {
-                rendererEngine.renderPdfPages(candidateFile, scale = 2.0f)
-            } catch (_: Exception) {
-                emptyList()
+            FileInputStream(sourcePdf).use { input ->
+                FileOutputStream(candidateFile).use { output ->
+                    if (headerOffset < 0) {
+                        output.write("%PDF-1.7\n".toByteArray(Charsets.US_ASCII))
+                        fixedIssues += "Menambahkan header PDF yang hilang"
+                    } else if (headerOffset > 0) {
+                        input.skipExactly(headerOffset.toLong())
+                        fixedIssues += "Menghapus $headerOffset byte sampah sebelum header PDF"
+                    }
+                    input.copyTo(output)
+                    if (!hasTrailer) {
+                        output.write("\n%%EOF\n".toByteArray(Charsets.US_ASCII))
+                        fixedIssues += "Menambahkan marker %%EOF yang hilang"
+                    }
+                }
             }
-            val pageBitmaps = if (repairedCandidatePages.isNotEmpty()) {
-                repairedCandidatePages
-            } else {
-                rendererEngine.renderPdfPages(sourcePdf, scale = 2.0f)
-            }
 
-            require(pageBitmaps.isNotEmpty()) {
+            val candidatePageCount = rendererEngine.getPageCount(candidateFile)
+            val originalPageCount = if (candidatePageCount == 0) rendererEngine.getPageCount(sourcePdf) else 0
+            val renderSource = when {
+                candidatePageCount > 0 -> candidateFile
+                originalPageCount > 0 -> sourcePdf
+                else -> throw IllegalArgumentException(
                 "Tidak ada halaman PDF yang dapat dirender; perbaikan dihentikan agar tidak menghasilkan berkas rusak palsu"
+                )
             }
+            val dimensions = rendererEngine.getPageDimensions(renderSource)
 
-            val cleanDoc = PdfDocument()
-            try {
-                for ((idx, bmp) in pageBitmaps.withIndex()) {
-                    val pInfo = PdfDocument.PageInfo.Builder(bmp.width, bmp.height, idx + 1).create()
-                    val page = cleanDoc.startPage(pInfo)
-                    page.canvas.drawBitmap(bmp, 0f, 0f, null)
-                    cleanDoc.finishPage(page)
-                }
-
-                outputPdf.parentFile?.mkdirs()
-                FileOutputStream(outputPdf).use { out ->
-                    cleanDoc.writeTo(out)
-                }
-                fixedIssues.add("Membangun ulang struktur internal tabel xref & object dictionary (${pageBitmaps.size} halaman)")
-            } finally {
-                cleanDoc.close()
-                pageBitmaps.forEach { bitmap ->
-                    if (!bitmap.isRecycled) bitmap.recycle()
+            PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
+                val cleanDocument = PdfDocument()
+                try {
+                    rendererEngine.forEachRenderedPage(renderSource, scale = 1.6f) { pageIndex, bitmap ->
+                        val originalPage = dimensions[pageIndex]
+                        val pageInfo = PdfDocument.PageInfo.Builder(
+                            originalPage.width,
+                            originalPage.height,
+                            pageIndex + 1
+                        ).create()
+                        val page = cleanDocument.startPage(pageInfo)
+                        page.canvas.drawBitmap(
+                            bitmap,
+                            null,
+                            Rect(0, 0, originalPage.width, originalPage.height),
+                            Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                        )
+                        cleanDocument.finishPage(page)
+                    }
+                    FileOutputStream(temporaryOutput).use { cleanDocument.writeTo(it) }
+                } finally {
+                    cleanDocument.close()
                 }
             }
+            fixedIssues += "Membangun ulang struktur xref dan object dictionary (${dimensions.size} halaman)"
 
             Result.success(
                 RepairReport(
@@ -96,11 +98,45 @@ class PdfRepairEngine(
                     wasSuccessful = true
                 )
             )
-        } catch (e: Exception) {
-            if (outputPdf.exists() && outputPdf.length() == 0L) outputPdf.delete()
-            Result.failure(e)
+        } catch (error: Exception) {
+            Result.failure(error)
+        } catch (oom: OutOfMemoryError) {
+            Result.failure(IllegalStateException("Memori tidak cukup untuk memperbaiki PDF", oom))
         } finally {
             tempFile?.delete()
+        }
+    }
+
+    private fun findPdfHeaderOffset(file: File): Int {
+        val header = "%PDF-".toByteArray(Charsets.US_ASCII)
+        val prefix = ByteArray(minOf(4096L, file.length()).toInt())
+        val read = FileInputStream(file).use { it.read(prefix) }
+        for (start in 0..(read - header.size)) {
+            if (header.indices.all { offset -> prefix[start + offset] == header[offset] }) return start
+        }
+        return -1
+    }
+
+    private fun hasEofTrailer(file: File): Boolean {
+        val bytesToRead = minOf(4096L, file.length()).toInt()
+        if (bytesToRead == 0) return false
+        val tail = ByteArray(bytesToRead)
+        RandomAccessFile(file, "r").use { input ->
+            input.seek(file.length() - bytesToRead)
+            input.readFully(tail)
+        }
+        return String(tail, Charsets.ISO_8859_1).trimEnd().endsWith("%%EOF")
+    }
+
+    private fun java.io.InputStream.skipExactly(length: Long) {
+        var remaining = length
+        while (remaining > 0L) {
+            val skipped = skip(remaining)
+            if (skipped > 0L) remaining -= skipped
+            else {
+                require(read() >= 0) { "Berkas PDF terpotong saat memperbaiki header" }
+                remaining--
+            }
         }
     }
 }

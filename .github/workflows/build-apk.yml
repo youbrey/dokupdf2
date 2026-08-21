@@ -1,6 +1,10 @@
 name: Build Android APK
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       build_type:
@@ -25,6 +29,8 @@ jobs:
     name: Build APK (${{ github.event.inputs.build_type || 'debug' }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
 
     steps:
       - name: Checkout Code
@@ -35,7 +41,6 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
-          cache: 'gradle'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -50,7 +55,9 @@ jobs:
           # the repository previously omitted gradle-wrapper.jar.
           gradle-version: '9.3.1'
 
-      - name: Prepare Environment and Keystore
+      - name: Prepare Environment and Wrapper
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           # Copy .env.example to .env if .env does not exist
           if [ ! -f .env ]; then
@@ -61,19 +68,9 @@ jobs:
             fi
           fi
 
-          # If GEMINI_API_KEY secret exists in repo, append or replace
-          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
-            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
-          fi
-
-          # Decode debug keystore if base64 file exists, or generate fallback debug keystore
-          if [ ! -f debug.keystore ]; then
-            if [ -f debug.keystore.base64 ]; then
-              (base64 -d debug.keystore.base64 > debug.keystore) || (base64 -D debug.keystore.base64 > debug.keystore) || true
-            fi
-          fi
-          if [ ! -f debug.keystore ] || [ ! -s debug.keystore ]; then
-            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          # Append the CI secret last so java.util.Properties uses it over the example value.
+          if [ -n "$GEMINI_API_KEY" ]; then
+            printf '\nGEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" >> .env
           fi
 
           # Regenerate an incomplete wrapper (the repository previously omitted its JAR).
@@ -97,11 +94,11 @@ jobs:
           if-no-files-found: warn
 
       - name: Build Debug APK
-        if: ${{ success() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '') }}
+        if: ${{ success() && (env.BUILD_TYPE == 'debug' || env.BUILD_TYPE == 'both') }}
         run: ./gradlew assembleDebug --stacktrace
 
       - name: Upload Debug APK Artifact
-        if: ${{ success() && (github.event.inputs.build_type == 'debug' || github.event.inputs.build_type == 'both' || github.event.inputs.build_type == '') }}
+        if: ${{ success() && (env.BUILD_TYPE == 'debug' || env.BUILD_TYPE == 'both') }}
         uses: actions/upload-artifact@v7
         with:
           name: dokupdf-app-debug
@@ -110,11 +107,11 @@ jobs:
           if-no-files-found: error
 
       - name: Build Release APK
-        if: ${{ success() && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both') }}
+        if: ${{ success() && (env.BUILD_TYPE == 'release' || env.BUILD_TYPE == 'both') }}
         run: ./gradlew assembleRelease --stacktrace
 
       - name: Upload Release APK Artifact
-        if: ${{ success() && (github.event.inputs.build_type == 'release' || github.event.inputs.build_type == 'both') }}
+        if: ${{ success() && (env.BUILD_TYPE == 'release' || env.BUILD_TYPE == 'both') }}
         uses: actions/upload-artifact@v7
         with:
           name: dokupdf-app-release

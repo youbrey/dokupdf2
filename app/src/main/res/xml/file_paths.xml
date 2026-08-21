@@ -2,5 +2,6 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- PDFs are written to context.filesDir/documents (see ScannerScreen.onSavePdf) -->
     <files-path name="documents" path="documents/" />
-    <cache-path name="cache" path="." />
+    <!-- Non-library exports such as images, DOCX, CSV, and encrypted containers. -->
+    <files-path name="tools_output" path="tools_output/" />
 </paths>

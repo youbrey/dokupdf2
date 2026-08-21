@@ -39,6 +39,8 @@ import com.example.core.engine.DocumentController
 import com.example.core.engine.DocumentEngine
 import com.example.core.layout.PageLayoutInfo
 import com.example.core.model.*
+import com.example.core.pdf.OfficeFileParser
+import com.example.core.pdf.PdfFileUtils
 import com.example.core.pdf.PdfGenerator
 import com.example.core.render.RenderEngine
 import com.example.ui.components.SleekTopAppBar
@@ -59,12 +61,14 @@ fun DocumentEditorScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    val documentEngine = remember {
-        DocumentEngine(
-            context = context,
-            initialDoc = initialDocument ?: createDefaultDocument()
-        )
+    val editorInitialDocument = remember(initialDocument) {
+        val candidate = initialDocument ?: createDefaultDocument()
+        val pages = candidate.pages
+            .ifEmpty { listOf(PageModel(pageIndex = 0)) }
+            .mapIndexed { index, page -> page.copy(pageIndex = index) }
+        candidate.copy(pages = pages)
     }
+    val documentEngine = remember(editorInitialDocument) { DocumentEngine(editorInitialDocument) }
     val documentController = remember { DocumentController(documentEngine) }
     val renderEngine = remember { RenderEngine() }
     val aiService = remember { GeminiAiService() }
@@ -75,7 +79,8 @@ fun DocumentEditorScreen(
     val canRedo by documentEngine.commandManager.canRedo.collectAsState()
 
     var activePageIndex by remember { mutableStateOf(0) }
-    var documentTitle by remember { mutableStateOf(initialDocument?.title ?: "Dokumen Baru") }
+    var documentTitle by remember(editorInitialDocument.id) { mutableStateOf(editorInitialDocument.title) }
+    var isExportingPdf by remember { mutableStateOf(false) }
 
     // Transformation State for Zoom & Pan Canvas
     var scale by remember { mutableStateOf(1f) }
@@ -109,10 +114,29 @@ fun DocumentEditorScreen(
     var selectedFontSize by remember { mutableStateOf(14f) }
     var selectedAlignment by remember { mutableStateOf(0) } // 0: Left, 1: Center, 2: Right, 3: Justify
 
+    LaunchedEffect(documentState.pages.size) {
+        activePageIndex = activePageIndex.coerceIn(0, documentState.pages.lastIndex.coerceAtLeast(0))
+    }
+
     // Active page
     val activePage = documentState.pages.getOrNull(activePageIndex)
-        ?: documentState.pages.firstOrNull()
-        ?: PageModel(pageIndex = 0)
+        ?: documentState.pages.first()
+    val pageAspectRatio = (activePage.width / activePage.height)
+        .takeIf { it.isFinite() && it > 0f }
+        ?: (595.28f / 841.89f)
+    val maximumCanvasWidth = 340f
+    val maximumCanvasHeight = 480f
+    val maximumCanvasAspect = maximumCanvasWidth / maximumCanvasHeight
+    val pageCanvasWidth = if (pageAspectRatio >= maximumCanvasAspect) {
+        maximumCanvasWidth
+    } else {
+        (maximumCanvasHeight * pageAspectRatio).coerceAtLeast(80f)
+    }
+    val pageCanvasHeight = if (pageAspectRatio >= maximumCanvasAspect) {
+        (maximumCanvasWidth / pageAspectRatio).coerceAtLeast(80f)
+    } else {
+        maximumCanvasHeight
+    }
 
     Scaffold(
         topBar = {
@@ -149,21 +173,52 @@ fun DocumentEditorScreen(
                     // Export PDF Button
                     IconButton(
                         onClick = {
+                            if (isExportingPdf) return@IconButton
                             scope.launch {
-                                val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-                                val fileName = "${documentTitle.replace(" ", "_")}_$timeStamp.pdf"
-                                val exportDir = File(context.filesDir, "exports").apply { mkdirs() }
-                                val targetFile = File(exportDir, fileName)
+                                isExportingPdf = true
+                                try {
+                                    val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+                                    val documentsDir = File(context.filesDir, "documents").apply { mkdirs() }
+                                    val safeTitle = PdfFileUtils.sanitizeFileName(documentTitle, "Dokumen")
+                                    val targetFile = PdfFileUtils.uniqueFile(
+                                        documentsDir,
+                                        "${safeTitle}_$timeStamp",
+                                        "pdf"
+                                    )
 
-                                val result = pdfGenerator.exportToPdf(documentState, targetFile)
-                                if (result.isSuccess) {
-                                    Toast.makeText(context, "PDF Berhasil Diekspor: $fileName", Toast.LENGTH_LONG).show()
-                                    onDocumentSaved()
-                                } else {
-                                    Toast.makeText(context, "Gagal mengekspor PDF: ${result.exceptionOrNull()?.message}", Toast.LENGTH_SHORT).show()
+                                    val result = pdfGenerator.exportToPdf(documentState, targetFile)
+                                    if (result.isSuccess) {
+                                        Toast.makeText(
+                                            context,
+                                            "PDF tersimpan: ${targetFile.name}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        onDocumentSaved()
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            "Gagal mengekspor PDF: ${result.exceptionOrNull()?.message}",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                } catch (error: Exception) {
+                                    Toast.makeText(
+                                        context,
+                                        "Gagal menyiapkan ekspor: ${error.message ?: "penyimpanan tidak tersedia"}",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                } catch (_: OutOfMemoryError) {
+                                    Toast.makeText(
+                                        context,
+                                        "Memori tidak cukup untuk mengekspor dokumen ini.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                } finally {
+                                    isExportingPdf = false
                                 }
                             }
                         },
+                        enabled = !isExportingPdf,
                         modifier = Modifier.testTag("editor_export_pdf_btn")
                     ) {
                         Icon(
@@ -273,7 +328,7 @@ fun DocumentEditorScreen(
             ) {
                 Canvas(
                     modifier = Modifier
-                        .size(340.dp, 480.dp)
+                        .size(pageCanvasWidth.dp, pageCanvasHeight.dp)
                         .graphicsLayer {
                             scaleX = scale
                             scaleY = scale
@@ -307,7 +362,7 @@ fun DocumentEditorScreen(
             text = {
                 OutlinedTextField(
                     value = textInput,
-                    onValueChange = { textInput = it },
+                    onValueChange = { if (it.length <= 100_000) textInput = it },
                     label = { Text("Tulis teks di sini...") },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -319,24 +374,15 @@ fun DocumentEditorScreen(
                 Button(
                     onClick = {
                         if (textInput.isNotBlank()) {
-                            val paragraph = Block.ParagraphBlock(
-                                runs = listOf(
-                                    TextRun(
-                                        text = textInput,
-                                        isBold = isBold,
-                                        isItalic = isItalic,
-                                        isUnderline = isUnderline,
-                                        fontSize = selectedFontSize
-                                    )
-                                ),
+                            val paragraphs = paragraphBlocksFromText(
+                                text = textInput,
+                                isBold = isBold,
+                                isItalic = isItalic,
+                                isUnderline = isUnderline,
+                                fontSize = selectedFontSize,
                                 alignment = selectedAlignment
                             )
-                            val updatedBlocks = activePage.blocks + paragraph
-                            val updatedPage = activePage.copy(blocks = updatedBlocks)
-                            val newPages = documentState.pages.map {
-                                if (it.id == activePage.id) updatedPage else it
-                            }
-                            documentController.reorderPages(newPages)
+                            appendParagraphsAcrossPages(documentController, activePage, paragraphs)
                             showInsertTextDialog = false
                         }
                     },
@@ -357,6 +403,8 @@ fun DocumentEditorScreen(
     if (showTableDialog) {
         var rowsText by remember { mutableStateOf("3") }
         var colsText by remember { mutableStateOf("3") }
+        var tableData by remember { mutableStateOf("") }
+        var tableError by remember { mutableStateOf<String?>(null) }
         AlertDialog(
             onDismissRequest = { showTableDialog = false },
             title = { Text("Sisipkan Tabel", style = MaterialTheme.typography.titleMedium) },
@@ -374,21 +422,50 @@ fun DocumentEditorScreen(
                         label = { Text("Jumlah Kolom") },
                         modifier = Modifier.fillMaxWidth()
                     )
+                    OutlinedTextField(
+                        value = tableData,
+                        onValueChange = {
+                            if (it.length <= 20_000) tableData = it
+                            tableError = null
+                        },
+                        label = { Text("Isi tabel (opsional)") },
+                        supportingText = { Text("Pisahkan kolom dengan koma, titik koma, atau tab; baris dengan Enter.") },
+                        minLines = 3,
+                        maxLines = 6,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    tableError?.let { error ->
+                        Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val rows = rowsText.toIntOrNull() ?: 3
-                        val cols = colsText.toIntOrNull() ?: 3
-                        val table = createSampleTable(rows, cols)
-                        val updatedBlocks = activePage.blocks + table
-                        val updatedPage = activePage.copy(blocks = updatedBlocks)
-                        val newPages = documentState.pages.map {
-                            if (it.id == activePage.id) updatedPage else it
+                        val rows = rowsText.toIntOrNull()
+                        val columns = colsText.toIntOrNull()
+                        when {
+                            rows == null || rows !in 1..12 -> tableError = "Jumlah baris harus 1–12 per tabel."
+                            columns == null || columns !in 1..12 -> tableError = "Jumlah kolom harus 1–12."
+                            else -> runCatching {
+                                val inputRows = if (tableData.isBlank()) {
+                                    emptyList()
+                                } else {
+                                    OfficeFileParser.parseCsv(tableData)
+                                }
+                                createTable(rows, columns, inputRows)
+                            }.onSuccess { table ->
+                                val updatedBlocks = activePage.blocks + table
+                                val updatedPage = activePage.copy(blocks = updatedBlocks)
+                                val newPages = documentState.pages.map {
+                                    if (it.id == activePage.id) updatedPage else it
+                                }
+                                documentController.reorderPages(newPages)
+                                showTableDialog = false
+                            }.onFailure { error ->
+                                tableError = error.message ?: "Isi tabel tidak valid."
+                            }
                         }
-                        documentController.reorderPages(newPages)
-                        showTableDialog = false
                     }
                 ) {
                     Text("Buat Tabel")
@@ -405,13 +482,15 @@ fun DocumentEditorScreen(
     // AI Auto-Generate Letter Dialog
     if (showAiLetterDialog) {
         var letterType by remember { mutableStateOf("Surat Permohonan Izin Resmi") }
-        var senderName by remember { mutableStateOf("Ahmad Fauzi") }
-        var recipientName by remember { mutableStateOf("Kepala Divisi SDM") }
-        var purpose by remember { mutableStateOf("Izin cuti dinas dan keperluan mendesak keluarga") }
+        var senderName by remember { mutableStateOf("") }
+        var recipientName by remember { mutableStateOf("") }
+        var purpose by remember { mutableStateOf("") }
+        var additionalDetails by remember { mutableStateOf("") }
         var isGenerating by remember { mutableStateOf(false) }
+        var generationError by remember { mutableStateOf<String?>(null) }
 
         AlertDialog(
-            onDismissRequest = { showAiLetterDialog = false },
+            onDismissRequest = { if (!isGenerating) showAiLetterDialog = false },
             title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(imageVector = Icons.Default.AutoAwesome, contentDescription = null, tint = AccentIndigo)
@@ -423,28 +502,39 @@ fun DocumentEditorScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     OutlinedTextField(
                         value = letterType,
-                        onValueChange = { letterType = it },
+                        onValueChange = { if (it.length <= 300) letterType = it },
                         label = { Text("Jenis Surat") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = senderName,
-                        onValueChange = { senderName = it },
+                        onValueChange = { if (it.length <= 300) senderName = it },
                         label = { Text("Nama Pengirim") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = recipientName,
-                        onValueChange = { recipientName = it },
+                        onValueChange = { if (it.length <= 300) recipientName = it },
                         label = { Text("Penerima / Instansi") },
                         modifier = Modifier.fillMaxWidth()
                     )
                     OutlinedTextField(
                         value = purpose,
-                        onValueChange = { purpose = it },
+                        onValueChange = { if (it.length <= 2_000) purpose = it },
                         label = { Text("Perihal / Maksud") },
                         modifier = Modifier.fillMaxWidth()
                     )
+                    OutlinedTextField(
+                        value = additionalDetails,
+                        onValueChange = { if (it.length <= 4_000) additionalDetails = it },
+                        label = { Text("Rincian tambahan (opsional)") },
+                        minLines = 2,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    generationError?.let { error ->
+                        Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             },
             confirmButton = {
@@ -452,38 +542,41 @@ fun DocumentEditorScreen(
                     onClick = {
                         isGenerating = true
                         scope.launch {
-                            val result = aiService.generateLetter(
-                                letterType = letterType,
-                                senderName = senderName,
-                                recipientName = recipientName,
-                                purpose = purpose,
-                                additionalDetails = "Format formal baku Bahasa Indonesia"
-                            )
-                            isGenerating = false
-                            if (result.isSuccess) {
-                                val generatedText = result.getOrNull() ?: ""
-                                val lines = generatedText.lines().filter { it.isNotBlank() }
-                                val newBlocks = lines.map { line ->
-                                    Block.ParagraphBlock(
-                                        runs = listOf(
-                                            TextRun(
-                                                text = line,
-                                                fontSize = 13f
-                                            )
-                                        ),
+                            try {
+                                val result = aiService.generateLetter(
+                                    letterType = letterType.trim(),
+                                    senderName = senderName.trim(),
+                                    recipientName = recipientName.trim(),
+                                    purpose = purpose.trim(),
+                                    additionalDetails = additionalDetails.trim()
+                                )
+                                if (result.isSuccess) {
+                                    val generatedText = result.getOrThrow()
+                                    require(generatedText.isNotBlank()) { "Generator tidak menghasilkan isi surat" }
+                                    require(generatedText.length <= 200_000) {
+                                        "Isi surat terlalu panjang untuk editor"
+                                    }
+                                    val newBlocks = paragraphBlocksFromText(
+                                        text = generatedText,
+                                        fontSize = 13f,
                                         alignment = 0
                                     )
+                                    appendParagraphsAcrossPages(documentController, activePage, newBlocks)
+                                    showAiLetterDialog = false
+                                } else {
+                                    generationError = result.exceptionOrNull()?.message ?: "Surat gagal dibuat."
                                 }
-                                val updatedPage = activePage.copy(blocks = activePage.blocks + newBlocks)
-                                val newPages = documentState.pages.map {
-                                    if (it.id == activePage.id) updatedPage else it
-                                }
-                                documentController.reorderPages(newPages)
-                                showAiLetterDialog = false
+                            } catch (_: OutOfMemoryError) {
+                                generationError = "Memori tidak cukup untuk memasukkan hasil surat ke editor."
+                            } catch (error: Exception) {
+                                generationError = error.message ?: "Surat gagal dibuat."
+                            } finally {
+                                isGenerating = false
                             }
                         }
                     },
-                    enabled = !isGenerating
+                    enabled = !isGenerating && letterType.isNotBlank() && senderName.isNotBlank() &&
+                        recipientName.isNotBlank() && purpose.isNotBlank()
                 ) {
                     if (isGenerating) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
@@ -721,6 +814,7 @@ private fun applyFormatting(
             block.copy(runs = updatedRuns, alignment = alignment)
         } else block
     }
+    if (updatedBlocks == activePage.blocks) return
     val updatedPage = activePage.copy(blocks = updatedBlocks)
     val newPages = controller.documentState.value.pages.map {
         if (it.id == activePage.id) updatedPage else it
@@ -729,41 +823,121 @@ private fun applyFormatting(
 }
 
 private fun createDefaultDocument(): DocumentModel {
-    val samplePage = PageModel(
-        pageIndex = 0,
-        blocks = listOf(
-            Block.ParagraphBlock(
-                runs = listOf(
-                    TextRun(
-                        text = "SURAT KEPUTUSAN & PERJANJIAN DOKUPDF",
-                        isBold = true,
-                        fontSize = 16f
-                    )
-                ),
-                alignment = 1
-            ),
-            Block.ParagraphBlock(
-                runs = listOf(
-                    TextRun(
-                        text = "Dokumen ini dirender dengan Custom Canvas Engine berkinerja tinggi sesuai arsitektur Clean & MVVM.",
-                        fontSize = 12f
-                    )
-                ),
-                alignment = 3
-            )
-        )
-    )
     return DocumentModel(
-        title = "Dokumen Resmi",
-        pages = listOf(samplePage)
+        title = "Dokumen Baru",
+        pages = listOf(PageModel(pageIndex = 0))
     )
 }
 
-private fun createSampleTable(rows: Int, cols: Int): Block.TableBlock {
-    val tableCells = (0 until rows).map { r ->
-        (0 until cols).map { c ->
-            if (r == 0) "Kolom ${c + 1}" else "Data R${r}C${c}"
+private fun createTable(rows: Int, columns: Int, inputRows: List<List<String>>): Block.TableBlock {
+    require(rows in 1..12 && columns in 1..12) { "Ukuran tabel tidak valid" }
+    val tableCells = List(rows) { row ->
+        List(columns) { column ->
+            inputRows.getOrNull(row)?.getOrNull(column).orEmpty()
         }
     }
-    return Block.TableBlock(rows = rows, cols = cols, cells = tableCells)
+    return Block.TableBlock(rows = rows, cols = columns, cells = tableCells)
+}
+
+private fun paragraphBlocksFromText(
+    text: String,
+    isBold: Boolean = false,
+    isItalic: Boolean = false,
+    isUnderline: Boolean = false,
+    fontSize: Float,
+    alignment: Int,
+    maximumCharactersPerBlock: Int = 500
+): List<Block.ParagraphBlock> {
+    require(maximumCharactersPerBlock in 100..2_000) { "Batas potongan paragraf tidak valid" }
+    return text.lines().flatMap { originalLine ->
+        val chunks = if (originalLine.isBlank()) {
+            listOf(" ")
+        } else {
+            val result = mutableListOf<String>()
+            var remaining = originalLine.trimEnd()
+            while (remaining.length > maximumCharactersPerBlock) {
+                val naturalBreak = remaining.lastIndexOf(' ', maximumCharactersPerBlock)
+                    .takeIf { it >= maximumCharactersPerBlock / 2 }
+                    ?: maximumCharactersPerBlock
+                result += remaining.substring(0, naturalBreak).trimEnd()
+                remaining = remaining.substring(naturalBreak).trimStart()
+            }
+            if (remaining.isNotEmpty()) result += remaining
+            result
+        }
+        chunks.map { chunk ->
+            Block.ParagraphBlock(
+                runs = listOf(
+                    TextRun(
+                        text = chunk,
+                        isBold = isBold,
+                        isItalic = isItalic,
+                        isUnderline = isUnderline,
+                        fontSize = fontSize
+                    )
+                ),
+                alignment = alignment
+            )
+        }
+    }
+}
+
+private fun appendParagraphsAcrossPages(
+    controller: DocumentController,
+    activePage: PageModel,
+    paragraphs: List<Block.ParagraphBlock>,
+    maximumBlocksPerPage: Int = 24
+) {
+    if (paragraphs.isEmpty()) return
+    val currentDocument = controller.documentState.value
+    val activeIndex = currentDocument.pages.indexOfFirst { it.id == activePage.id }
+    if (activeIndex < 0) return
+
+    val updatedPages = currentDocument.pages.toMutableList()
+    var destinationIndex = activeIndex
+    var destinationPage = updatedPages[destinationIndex]
+    var occupiedHeight = destinationPage.blocks.sumOf { block ->
+        estimatedBlockHeight(block, destinationPage.width).toDouble()
+    }.toFloat()
+
+    paragraphs.forEach { paragraph ->
+        val usableHeight = (destinationPage.height - 96f).coerceAtLeast(80f)
+        val paragraphHeight = estimatedBlockHeight(paragraph, destinationPage.width)
+        val fitsCurrentPage = destinationPage.blocks.size < maximumBlocksPerPage &&
+            occupiedHeight + paragraphHeight <= usableHeight
+
+        if (fitsCurrentPage) {
+            destinationPage = destinationPage.copy(blocks = destinationPage.blocks + paragraph)
+            updatedPages[destinationIndex] = destinationPage
+            occupiedHeight += paragraphHeight
+        } else {
+            // Overflow text is inserted on a normal A4 page instead of inheriting a tiny imported
+            // card/receipt size that could never contain an editable paragraph.
+            destinationPage = PageModel(blocks = listOf(paragraph))
+            destinationIndex++
+            updatedPages.add(destinationIndex, destinationPage)
+            occupiedHeight = estimatedBlockHeight(paragraph, destinationPage.width)
+        }
+    }
+    controller.reorderPages(updatedPages)
+}
+
+private fun estimatedBlockHeight(block: Block, pageWidth: Float): Float = when (block) {
+    is Block.ParagraphBlock -> {
+        val fontSize = block.runs.maxOfOrNull { it.fontSize.coerceIn(8f, 72f) } ?: 14f
+        val usableWidth = (pageWidth - 96f).coerceAtLeast(fontSize)
+        val charactersPerLine = (usableWidth / (fontSize * 0.55f)).toInt().coerceAtLeast(1)
+        val text = block.runs.joinToString(separator = "") { it.text }
+        val lineCount = text.split('\n').sumOf { line ->
+            maxOf(1, kotlin.math.ceil(line.length.toDouble() / charactersPerLine).toInt())
+        }
+        lineCount * fontSize * 1.35f + 18f
+    }
+    is Block.TableBlock -> block.rows.coerceIn(1, 500) * 36f + 24f
+    is Block.ImageBlock -> {
+        val requestedHeight = block.height.takeIf { it.isFinite() && it > 0f }
+            ?: block.bitmap?.height?.toFloat()
+            ?: 100f
+        requestedHeight + 24f
+    }
 }

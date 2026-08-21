@@ -39,6 +39,6 @@ class HomeScreenScreenshotTest {
       }
     }
 
-    composeTestRule.onRoot().captureRoboImage(filePath = "src/test/screenshots/home-empty.png")
+    composeTestRule.onRoot().captureRoboImage(filePath = "build/outputs/roborazzi/home-empty.png")
   }
 }

@@ -6,6 +6,7 @@ import android.graphics.Paint as AndroidPaint
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
@@ -25,7 +26,9 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 
@@ -37,7 +40,8 @@ fun SignaturePadDialog(
     val paths = remember { mutableStateListOf<List<Offset>>() }
     var currentPath = remember { mutableStateListOf<Offset>() }
     var selectedColor by remember { mutableStateOf(Color.Black) }
-    var strokeWidth by remember { mutableStateOf(5f) }
+    val strokeWidth = 5f
+    var padSize by remember { mutableStateOf(IntSize.Zero) }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
@@ -74,6 +78,7 @@ fun SignaturePadDialog(
                         .clip(RoundedCornerShape(8.dp))
                         .background(Color(0xFFFAFAFA))
                         .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(8.dp))
+                        .onSizeChanged { padSize = it }
                         .pointerInput(Unit) {
                             detectDragGestures(
                                 onDragStart = { offset ->
@@ -84,10 +89,12 @@ fun SignaturePadDialog(
                                     currentPath.add(change.position)
                                 },
                                 onDragEnd = {
-                                    if (currentPath.isNotEmpty()) {
+                                    if (currentPath.size > 1) {
                                         paths.add(currentPath.toList())
                                     }
-                                }
+                                    currentPath.clear()
+                                },
+                                onDragCancel = { currentPath.clear() }
                             )
                         }
                 ) {
@@ -152,9 +159,7 @@ fun SignaturePadDialog(
                                         color = if (selectedColor == col) MaterialTheme.colorScheme.primary else Color.LightGray,
                                         shape = CircleShape
                                     )
-                                    .pointerInput(Unit) {
-                                        detectDragGestures(onDragStart = { selectedColor = col }, onDrag = { _, _ -> })
-                                    }
+                                    .clickable { selectedColor = col }
                             )
                         }
                     }
@@ -186,7 +191,7 @@ fun SignaturePadDialog(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            val bitmap = renderToBitmap(paths, selectedColor, strokeWidth)
+                            val bitmap = renderToBitmap(paths, selectedColor, strokeWidth, padSize)
                             onSaveSignature(bitmap)
                         },
                         enabled = paths.isNotEmpty() || currentPath.isNotEmpty(),
@@ -202,9 +207,18 @@ fun SignaturePadDialog(
     }
 }
 
-private fun renderToBitmap(paths: List<List<Offset>>, color: Color, strokeWidth: Float): Bitmap {
+private fun renderToBitmap(
+    paths: List<List<Offset>>,
+    color: Color,
+    strokeWidth: Float,
+    sourceSize: IntSize
+): Bitmap {
     val width = 400
     val height = 200
+    require(sourceSize.width > 0 && sourceSize.height > 0) { "Ukuran area tanda tangan tidak valid" }
+    val scaleX = width.toFloat() / sourceSize.width
+    val scaleY = height.toFloat() / sourceSize.height
+    val strokeScale = (scaleX + scaleY) / 2f
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     val canvas = AndroidCanvas(bitmap)
 
@@ -216,7 +230,7 @@ private fun renderToBitmap(paths: List<List<Offset>>, color: Color, strokeWidth:
             (color.blue * 255).toInt()
         )
         this.style = AndroidPaint.Style.STROKE
-        this.strokeWidth = strokeWidth
+        this.strokeWidth = (strokeWidth * strokeScale).coerceAtLeast(1f)
         this.strokeCap = AndroidPaint.Cap.ROUND
         this.strokeJoin = AndroidPaint.Join.ROUND
     }
@@ -224,9 +238,9 @@ private fun renderToBitmap(paths: List<List<Offset>>, color: Color, strokeWidth:
     for (pts in paths) {
         if (pts.size > 1) {
             val p = android.graphics.Path()
-            p.moveTo(pts.first().x, pts.first().y)
+            p.moveTo(pts.first().x * scaleX, pts.first().y * scaleY)
             for (pt in pts.drop(1)) {
-                p.lineTo(pt.x, pt.y)
+                p.lineTo(pt.x * scaleX, pt.y * scaleY)
             }
             canvas.drawPath(p, paint)
         }

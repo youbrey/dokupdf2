@@ -68,6 +68,8 @@ fun DokuPdfApp() {
 
     var currentScreen by remember { mutableStateOf(AppScreen.HOME) }
     var selectedDocumentModel by remember { mutableStateOf<DocumentModel?>(null) }
+    var requestedToolId by remember { mutableStateOf<String?>(null) }
+    var requestedToolCategory by remember { mutableStateOf<String?>(null) }
     var searchQuery by remember { mutableStateOf("") }
     var isOpeningDocument by remember { mutableStateOf(false) }
     val documents by repository.documents.collectAsState()
@@ -81,7 +83,13 @@ fun DokuPdfApp() {
             if (currentScreen == AppScreen.HOME || currentScreen == AppScreen.TOOLS) {
                 SleekBottomNavigationBar(
                     currentScreen = currentScreen,
-                    onNavigate = { screen -> currentScreen = screen },
+                    onNavigate = { screen ->
+                        if (screen == AppScreen.TOOLS) {
+                            requestedToolId = null
+                            requestedToolCategory = null
+                        }
+                        currentScreen = screen
+                    },
                     onOpenScanner = { currentScreen = AppScreen.SCANNER }
                 )
             }
@@ -113,37 +121,61 @@ fun DokuPdfApp() {
                             if (!isOpeningDocument) {
                                 isOpeningDocument = true
                                 scope.launch {
-                                    val renderScale = 2.0f
-                                    val bitmaps = pdfRenderer.renderPdfPages(doc.file, scale = renderScale)
-                                    val pages = if (bitmaps.isNotEmpty()) {
-                                        bitmaps.mapIndexed { index, bmp ->
+                                    var renderedBitmaps: List<android.graphics.Bitmap> = emptyList()
+                                    var ownershipTransferredToEditor = false
+                                    try {
+                                        val dimensions = pdfRenderer.getPageDimensions(doc.file)
+                                        require(dimensions.isNotEmpty()) { "PDF tidak memiliki halaman yang dapat dibaca" }
+                                        val totalPagePixels = dimensions.sumOf {
+                                            it.width.toDouble() * it.height.toDouble()
+                                        }.coerceAtLeast(1.0)
+                                        // Keep the complete document editable while bounding its total
+                                        // decoded bitmap budget to roughly 48 MB (12M ARGB pixels).
+                                        val requiredScale = kotlin.math.sqrt(12_000_000.0 / totalPagePixels)
+                                            .toFloat()
+                                        require(requiredScale >= 0.02f) {
+                                            "Dokumen terlalu besar untuk dibuka sekaligus; pisahkan PDF terlebih dahulu"
+                                        }
+                                        val renderScale = requiredScale.coerceAtMost(1.6f)
+                                        renderedBitmaps = pdfRenderer.renderPdfPages(doc.file, scale = renderScale)
+                                        require(renderedBitmaps.size == dimensions.size) {
+                                            "Tidak semua halaman PDF berhasil dirender"
+                                        }
+                                        val pages = renderedBitmaps.mapIndexed { index, bitmap ->
                                             PageModel(
                                                 pageIndex = index,
-                                                originalBitmap = bmp,
-                                                processedBitmap = bmp,
-                                                // Convert back from rendered pixels to the PDF's
-                                                // real page size in points, so the bitmap's aspect
-                                                // ratio matches the page bounds exactly (RenderEngine
-                                                // stretches the bitmap to fill page bounds, so a
-                                                // mismatch here would visibly distort the scan).
-                                                width = bmp.width / renderScale,
-                                                height = bmp.height / renderScale
+                                                originalBitmap = bitmap,
+                                                width = dimensions[index].width.toFloat(),
+                                                height = dimensions[index].height.toFloat()
                                             )
                                         }
-                                    } else {
-                                        // File couldn't be rendered (corrupt/unreadable) -- fall
-                                        // back to a single blank page instead of leaving the user
-                                        // on the Home screen with no feedback at all.
-                                        Toast.makeText(context, "Gagal membuka dokumen: file tidak dapat dibaca", Toast.LENGTH_SHORT).show()
-                                        listOf(PageModel(pageIndex = 0))
+                                        selectedDocumentModel = DocumentModel(
+                                            title = doc.title,
+                                            filePath = doc.file.absolutePath,
+                                            pages = pages
+                                        )
+                                        ownershipTransferredToEditor = true
+                                        currentScreen = AppScreen.EDITOR
+                                    } catch (error: Exception) {
+                                        Toast.makeText(
+                                            context,
+                                            "Gagal membuka dokumen: ${error.message ?: "PDF tidak dapat dibaca"}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } catch (_: OutOfMemoryError) {
+                                        Toast.makeText(
+                                            context,
+                                            "Memori tidak cukup untuk membuka seluruh dokumen. Pisahkan PDF terlebih dahulu.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } finally {
+                                        if (!ownershipTransferredToEditor) {
+                                            renderedBitmaps.forEach { bitmap ->
+                                                if (!bitmap.isRecycled) bitmap.recycle()
+                                            }
+                                        }
+                                        isOpeningDocument = false
                                     }
-                                    selectedDocumentModel = DocumentModel(
-                                        title = doc.title,
-                                        filePath = doc.file.absolutePath,
-                                        pages = pages
-                                    )
-                                    isOpeningDocument = false
-                                    currentScreen = AppScreen.EDITOR
                                 }
                             }
                         },
@@ -158,17 +190,40 @@ fun DokuPdfApp() {
                             currentScreen = AppScreen.SCANNER
                         },
                         onOpenPdfTools = {
+                            requestedToolId = null
+                            requestedToolCategory = null
                             currentScreen = AppScreen.TOOLS
                         },
                         onOpenAiTools = {
+                            requestedToolId = null
+                            requestedToolCategory = "AI Pro"
                             currentScreen = AppScreen.TOOLS
                         },
                         onDeleteDocument = { doc ->
                             scope.launch {
-                                repository.deleteDocument(doc)
+                                try {
+                                    if (!repository.deleteDocument(doc)) {
+                                        Toast.makeText(
+                                            context,
+                                            "Dokumen gagal dihapus dari penyimpanan.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                } catch (error: Exception) {
+                                    Toast.makeText(
+                                        context,
+                                        "Gagal menghapus dokumen: ${error.message ?: "penyimpanan tidak tersedia"}",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
                             }
                         },
                         onQuickAction = { action ->
+                            requestedToolId = when (action) {
+                                "ocr" -> "ocr_text"
+                                else -> null
+                            }
+                            requestedToolCategory = null
                             currentScreen = AppScreen.TOOLS
                         }
                     )
@@ -178,10 +233,15 @@ fun DokuPdfApp() {
                     DocumentEditorScreen(
                         initialDocument = selectedDocumentModel,
                         onBack = {
+                            // Release the root-level reference to rasterized PDF pages after the
+                            // editor leaves composition. Do not recycle them manually: Compose may
+                            // still replay the previous display list for one frame.
+                            selectedDocumentModel = null
                             currentScreen = AppScreen.HOME
                             scope.launch { repository.refreshDocuments() }
                         },
                         onDocumentSaved = {
+                            selectedDocumentModel = null
                             scope.launch { repository.refreshDocuments() }
                             currentScreen = AppScreen.HOME
                         }
@@ -204,13 +264,12 @@ fun DokuPdfApp() {
                 AppScreen.TOOLS -> {
                     PdfToolsScreen(
                         documents = documents,
-                        onBack = { currentScreen = AppScreen.HOME },
-                        onOpenEditor = {
-                            selectedDocumentModel = DocumentModel(
-                                title = "Dokumen Baru",
-                                pages = listOf(PageModel(pageIndex = 0))
-                            )
-                            currentScreen = AppScreen.EDITOR
+                        initialToolId = requestedToolId,
+                        initialCategory = requestedToolCategory,
+                        onBack = {
+                            requestedToolId = null
+                            requestedToolCategory = null
+                            currentScreen = AppScreen.HOME
                         },
                         onRefreshDocuments = {
                             scope.launch { repository.refreshDocuments() }
