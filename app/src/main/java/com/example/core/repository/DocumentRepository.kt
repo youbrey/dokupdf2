@@ -6,10 +6,13 @@ import android.graphics.BitmapFactory
 import com.example.core.model.DocumentModel
 import com.example.core.model.PageModel
 import com.example.core.pdf.PdfRendererEngine
+import com.example.core.pdf.PdfFileUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -29,17 +32,20 @@ data class SavedDocumentItem(
 )
 
 class DocumentRepository(
-    private val context: Context,
+    context: Context,
     private val pdfRenderer: PdfRendererEngine = PdfRendererEngine(context)
 ) {
+    private val context = context.applicationContext
 
     private val docsDir: File get() = File(context.filesDir, "documents").apply { mkdirs() }
     private val thumbsDir: File get() = File(context.cacheDir, "thumbnails").apply { mkdirs() }
 
     private val _documents = MutableStateFlow<List<SavedDocumentItem>>(emptyList())
     val documents: StateFlow<List<SavedDocumentItem>> = _documents.asStateFlow()
+    private val refreshMutex = Mutex()
 
     suspend fun refreshDocuments() = withContext(Dispatchers.IO) {
+        refreshMutex.withLock {
         val files = docsDir.listFiles { f -> f.extension.equals("pdf", ignoreCase = true) }?.sortedByDescending { it.lastModified() } ?: emptyList()
         val items = mutableListOf<SavedDocumentItem>()
 
@@ -47,24 +53,35 @@ class DocumentRepository(
 
         for (file in files) {
             val size = file.length()
-            val formattedSize = formatFileSize(size)
+            val formattedSize = PdfFileUtils.formatBytes(size)
             val dateStr = sdf.format(Date(file.lastModified()))
-            val pageCount = pdfRenderer.getPageCount(file).coerceAtLeast(1)
+            val pageCount = pdfRenderer.getPageCount(file)
 
             // Try load thumbnail from cache or render first page
-            val thumbFile = File(thumbsDir, "${file.nameWithoutExtension}_thumb.jpg")
-            val thumbBitmap = if (thumbFile.exists()) {
-                BitmapFactory.decodeFile(thumbFile.absolutePath)
-            } else {
+            val thumbnailKey = "${file.nameWithoutExtension}_${file.lastModified()}_${file.length()}_thumb.jpg"
+            val thumbFile = File(thumbsDir, PdfFileUtils.sanitizeFileName(thumbnailKey, "thumbnail.jpg"))
+            val cachedThumbnail = if (thumbFile.exists()) {
                 try {
-                    val pages = pdfRenderer.renderPdfPages(file, scale = 0.5f)
-                    val first = pages.firstOrNull()
-                    first?.let { bmp ->
+                    BitmapFactory.decodeFile(thumbFile.absolutePath).also { decoded ->
+                        if (decoded == null) thumbFile.delete()
+                    }
+                } catch (_: OutOfMemoryError) {
+                    null
+                }
+            } else null
+            val thumbBitmap = cachedThumbnail ?: run {
+                try {
+                    val firstPage = pdfRenderer.renderSinglePage(file, pageIndex = 0, scale = 0.5f)
+                    firstPage?.let { bitmap ->
                         FileOutputStream(thumbFile).use { out ->
-                            bmp.compress(Bitmap.CompressFormat.JPEG, 75, out)
+                            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 75, out)) {
+                                thumbFile.delete()
+                            }
                         }
                     }
-                    first
+                    firstPage
+                } catch (_: OutOfMemoryError) {
+                    null
                 } catch (e: Exception) {
                     null
                 }
@@ -85,42 +102,71 @@ class DocumentRepository(
         }
 
         _documents.value = items
+        val validThumbnailNames = items.mapNotNull { item ->
+            val source = item.file
+            "${source.nameWithoutExtension}_${source.lastModified()}_${source.length()}_thumb.jpg"
+                .let { PdfFileUtils.sanitizeFileName(it, "thumbnail.jpg") }
+        }.toSet()
+        thumbsDir.listFiles()?.forEach { cached ->
+            if (cached.name !in validThumbnailNames) cached.delete()
+        }
+        }
     }
 
     suspend fun savePdf(file: File, newName: String? = null): File = withContext(Dispatchers.IO) {
-        val targetName = (newName ?: file.nameWithoutExtension) + ".pdf"
-        val destFile = File(docsDir, targetName)
-        file.copyTo(destFile, overwrite = true)
+        PdfFileUtils.requirePdf(file)
+        val safeName = PdfFileUtils.sanitizeFileName(newName ?: file.nameWithoutExtension, "dokumen")
+            .let { name -> if (name.endsWith(".pdf", ignoreCase = true)) name.dropLast(4) else name }
+            .ifBlank { "dokumen" }
+        val requestedDestination = File(docsDir, "$safeName.pdf")
+        val destFile = when {
+            file.canonicalFile == requestedDestination.canonicalFile -> requestedDestination
+            requestedDestination.exists() -> PdfFileUtils.uniqueFile(docsDir, safeName, "pdf")
+            else -> requestedDestination
+        }
+        if (file.canonicalFile != destFile.canonicalFile) {
+            PdfFileUtils.writeAtomically(destFile, minimumBytes = 5L) { temporary ->
+                file.copyTo(temporary, overwrite = true)
+            }
+        }
         refreshDocuments()
         destFile
     }
 
     suspend fun createNewDocumentFile(baseTitle: String): File = withContext(Dispatchers.IO) {
         val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val cleanTitle = baseTitle.replace(Regex("[^a-zA-Z0-9_-]"), "_")
-        File(docsDir, "${cleanTitle}_$timeStamp.pdf")
+        val cleanTitle = PdfFileUtils.sanitizeFileName(baseTitle, "Dokumen").ifBlank { "Dokumen" }
+        PdfFileUtils.uniqueFile(docsDir, "${cleanTitle}_$timeStamp", "pdf")
     }
 
     suspend fun deleteDocument(item: SavedDocumentItem): Boolean = withContext(Dispatchers.IO) {
+        requireManagedDocument(item.file)
+        val thumbnailKey = "${item.file.nameWithoutExtension}_${item.file.lastModified()}_${item.file.length()}_thumb.jpg"
+        File(thumbsDir, PdfFileUtils.sanitizeFileName(thumbnailKey, "thumbnail.jpg")).delete()
         val deleted = item.file.delete()
-        File(thumbsDir, "${item.file.nameWithoutExtension}_thumb.jpg").delete()
         refreshDocuments()
         deleted
     }
 
     suspend fun renameDocument(item: SavedDocumentItem, newTitle: String): File = withContext(Dispatchers.IO) {
-        val clean = newTitle.replace(Regex("[^a-zA-Z0-9_ -]"), "").trim()
+        requireManagedDocument(item.file)
+        val clean = PdfFileUtils.sanitizeFileName(newTitle, "")
+            .let { name -> if (name.endsWith(".pdf", ignoreCase = true)) name.dropLast(4) else name }
+        require(clean.isNotBlank()) { "Nama dokumen tidak boleh kosong" }
         val newFile = File(docsDir, "$clean.pdf")
-        item.file.renameTo(newFile)
+        require(item.file.canonicalFile == newFile.canonicalFile || !newFile.exists()) {
+            "Dokumen bernama '$clean' sudah ada"
+        }
+        if (item.file.canonicalFile != newFile.canonicalFile) {
+            require(item.file.renameTo(newFile)) { "Dokumen gagal diganti nama" }
+        }
         refreshDocuments()
         newFile
     }
 
-    private fun formatFileSize(bytes: Long): String {
-        return when {
-            bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024f * 1024f))
-            bytes >= 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024f)
-            else -> "$bytes B"
+    private fun requireManagedDocument(file: File) {
+        require(file.canonicalFile.parentFile == docsDir.canonicalFile) {
+            "Operasi hanya diizinkan untuk dokumen di pustaka aplikasi"
         }
     }
 }

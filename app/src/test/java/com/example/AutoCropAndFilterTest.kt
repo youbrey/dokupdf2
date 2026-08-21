@@ -14,6 +14,7 @@ import com.example.core.model.CropGeometry
 import com.example.core.model.FilterSettings
 import com.example.core.model.FilterType
 import com.example.core.pdf.PdfSecurity
+import com.example.ui.screens.ScannedPageItem
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -138,6 +139,28 @@ class AutoCropAndFilterTest {
       assertTrue("ORIGINAL netral harus mengembalikan bitmap sumber", rendered === source)
       assertEquals(source.getPixel(16, 16), rendered.getPixel(16, 16))
     } finally {
+      source.recycle()
+    }
+  }
+
+  @Test
+  fun `scanner rendering never recycles bitmap owned by Compose state`() {
+    val source = Bitmap.createBitmap(320, 480, Bitmap.Config.ARGB_8888).apply {
+      eraseColor(Color.WHITE)
+    }
+    val page = ScannedPageItem(
+      originalBitmap = source,
+      filterType = FilterType.ORIGINAL,
+      filterSettings = FilterSettings()
+    )
+
+    val rendered = page.getRenderedBitmap(maxDimension = 240)
+    try {
+      assertFalse("Bitmap sumber UI tidak boleh di-recycle", source.isRecycled)
+      assertTrue("Hasil render harus memiliki ownership terpisah", rendered !== source)
+      assertTrue(rendered.width <= 240 && rendered.height <= 240)
+    } finally {
+      rendered.recycle()
       source.recycle()
     }
   }

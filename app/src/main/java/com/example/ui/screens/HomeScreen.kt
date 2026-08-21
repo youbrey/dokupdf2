@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +20,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -42,15 +45,18 @@ fun HomeScreen(
     onQuickAction: (String) -> Unit
 ) {
     var selectedFilter by remember { mutableStateOf("Semua") }
-    val filters = listOf("Semua", "PDF", "Scan", "Tersimpan")
+    var pendingDelete by remember { mutableStateOf<SavedDocumentItem?>(null) }
+    val filters = listOf("Semua", "Pindai", "Dokumen")
 
     val filteredDocs = remember(documents, searchQuery, selectedFilter) {
         documents.filter { doc ->
             val matchesSearch = searchQuery.isEmpty() ||
                     doc.title.contains(searchQuery, ignoreCase = true)
+            val isScan = doc.title.startsWith("Scan_", ignoreCase = true) ||
+                doc.title.startsWith("Scan ", ignoreCase = true)
             val matchesCategory = when (selectedFilter) {
-                "PDF" -> doc.file.extension.equals("pdf", ignoreCase = true)
-                "Scan" -> doc.title.contains("Scan", ignoreCase = true)
+                "Pindai" -> isScan
+                "Dokumen" -> !isScan
                 else -> true
             }
             matchesSearch && matchesCategory
@@ -154,7 +160,7 @@ fun HomeScreen(
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "Rich Text, Tabel, Multi-halaman, Tanda Tangan, Undo/Redo setara Word & Docs",
+                                    text = "Editor canvas untuk teks berformat, tabel, multi-halaman, tanda tangan, serta undo/redo",
                                     style = MaterialTheme.typography.bodySmall.copy(
                                         color = Color.White.copy(alpha = 0.9f)
                                     ),
@@ -332,11 +338,37 @@ fun HomeScreen(
                     DocumentItemRow(
                         doc = doc,
                         onOpen = { onOpenDocument(doc) },
-                        onDelete = { onDeleteDocument(doc) }
+                        onDelete = { pendingDelete = doc }
                     )
                 }
             }
         }
+    }
+
+    pendingDelete?.let { document ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Hapus dokumen?") },
+            text = {
+                Text("'${document.title}' akan dihapus permanen dari penyimpanan aplikasi.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        pendingDelete = null
+                        onDeleteDocument(document)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626))
+                ) {
+                    Text("Hapus")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) {
+                    Text("Batal")
+                }
+            }
+        )
     }
 }
 
@@ -347,6 +379,9 @@ fun DocumentItemRow(
     onDelete: () -> Unit
 ) {
     val isPdf = doc.file.extension.equals("pdf", ignoreCase = true)
+    val thumbnail = doc.thumbnailBitmap?.takeIf {
+        !it.isRecycled && it.width > 0 && it.height > 0
+    }
 
     val iconColor = if (isPdf) Color(0xFFEF4444) else SleekBluePrimary
     val iconBg = if (isPdf) Color(0xFFFEE2E2) else SleekBlueLight
@@ -373,12 +408,21 @@ fun DocumentItemRow(
                     .background(iconBg),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = Icons.Default.PictureAsPdf,
-                    contentDescription = doc.file.extension,
-                    tint = iconColor,
-                    modifier = Modifier.size(24.dp)
-                )
+                if (thumbnail != null) {
+                    Image(
+                        bitmap = thumbnail.asImageBitmap(),
+                        contentDescription = "Pratinjau ${doc.title}",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.PictureAsPdf,
+                        contentDescription = doc.file.extension,
+                        tint = iconColor,
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.width(12.dp))

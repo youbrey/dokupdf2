@@ -47,9 +47,14 @@ object FilterProcessor {
         val normalized = settings.normalized()
         if (normalized.isNeutral()) return preset
 
-        val adjusted = applyProfessionalAdjustments(preset, normalized)
-        if (preset !== source && preset !== adjusted && !preset.isRecycled) preset.recycle()
-        return adjusted
+        var adjusted: Bitmap? = null
+        return try {
+            applyProfessionalAdjustments(preset, normalized).also { adjusted = it }
+        } finally {
+            // A preset can itself be a full-resolution allocation. Release it both after a
+            // successful adjustment pass and when the second pass throws/OOMs.
+            if (preset !== source && preset !== adjusted && !preset.isRecycled) preset.recycle()
+        }
     }
 
     private fun applyAutoEnhance(source: Bitmap): Bitmap {
@@ -433,11 +438,16 @@ object FilterProcessor {
     /** Photo-safe enhancement that does not force paper pixels to white. */
     private fun applyPhotoEnhance(source: Bitmap): Bitmap {
         val output = applyColorMatrix(source, brightness = 1.03f, contrast = 1.10f, saturation = 1.12f)
-        val pixels = IntArray(output.width * output.height)
-        output.getPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
-        applyUnsharpSharpen(pixels, output.width, output.height, strength = 0.28f)
-        output.setPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
-        return output
+        return try {
+            val pixels = IntArray(output.width * output.height)
+            output.getPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+            applyUnsharpSharpen(pixels, output.width, output.height, strength = 0.28f)
+            output.setPixels(pixels, 0, output.width, 0, 0, output.width, output.height)
+            output
+        } catch (error: Throwable) {
+            if (!output.isRecycled) output.recycle()
+            throw error
+        }
     }
 
     /**

@@ -43,7 +43,7 @@ fun WatermarkDialog(
 
                 OutlinedTextField(
                     value = text,
-                    onValueChange = { text = it },
+                    onValueChange = { if (it.length <= 200) text = it },
                     label = { Text("Teks Tanda Air") },
                     singleLine = true,
                     modifier = Modifier
@@ -113,7 +113,7 @@ fun WatermarkDialog(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Ulangi teks di seluruh halaman (Tiled)",
+                        text = "Ulangi teks di seluruh area halaman (Tiled)",
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
@@ -133,7 +133,7 @@ fun WatermarkDialog(
                             if (text.isNotBlank()) {
                                 onApplyWatermark(
                                     WatermarkAnnotation(
-                                        text = text,
+                                        text = text.trim(),
                                         opacity = opacity,
                                         rotationDegrees = rotation,
                                         isTiled = isTiled
@@ -141,6 +141,7 @@ fun WatermarkDialog(
                                 )
                             }
                         },
+                        enabled = text.isNotBlank(),
                         modifier = Modifier.testTag("apply_watermark_button")
                     ) {
                         Text("Terapkan")
