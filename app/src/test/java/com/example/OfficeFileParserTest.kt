@@ -184,7 +184,15 @@ class OfficeFileParserTest {
         }
       }
 
-      assertTrue(result.exceptionOrNull()?.message.orEmpty(), result.isSuccess)
+      // [Audit fix] Pesan assertion sebelumnya hanya menampilkan `.message` (mis. "document
+      // is closed!") tanpa stack trace, sehingga baris kode persis yang melempar exception
+      // tidak pernah terlihat di laporan test/CI. Sekarang stack trace lengkap disertakan
+      // langsung di pesan kegagalan test supaya run CI berikutnya memberi info pasti
+      // (lihat docs/AUDIT_REPORT.md untuk konteks kegagalan "document is closed!").
+      assertTrue(
+        result.exceptionOrNull()?.let { android.util.Log.getStackTraceString(it) }.orEmpty(),
+        result.isSuccess
+      )
       assertTrue(previous?.isRecycled == true)
       assertEquals(6, PdfRendererEngine(context).getPageCount(output))
     } finally {
@@ -202,11 +210,21 @@ class OfficeFileParserTest {
     val renderer = PdfRendererEngine(context)
     try {
       val wordLines = (1..140).map { "Baris $it berisi teks panjang yang tetap harus masuk ke dokumen hasil." }
-      assertTrue(converter.wordLinesToPdf(wordLines, "Uji Word", wordPdf).isSuccess)
+      // [Audit fix] Sama seperti test di atas — tangkap Result ke variabel supaya pesan
+      // kegagalan bisa menyertakan stack trace lengkap, bukan cuma `.isSuccess` tanpa konteks.
+      val wordResult = converter.wordLinesToPdf(wordLines, "Uji Word", wordPdf)
+      assertTrue(
+        wordResult.exceptionOrNull()?.let { android.util.Log.getStackTraceString(it) }.orEmpty(),
+        wordResult.isSuccess
+      )
       assertTrue("Dokumen panjang harus lebih dari satu halaman", renderer.getPageCount(wordPdf) > 1)
 
       val rows = (0..90).map { row -> (0..11).map { column -> "R${row}C$column" } }
-      assertTrue(converter.excelRowsToPdf(rows, "Uji Spreadsheet", sheetPdf).isSuccess)
+      val sheetResult = converter.excelRowsToPdf(rows, "Uji Spreadsheet", sheetPdf)
+      assertTrue(
+        sheetResult.exceptionOrNull()?.let { android.util.Log.getStackTraceString(it) }.orEmpty(),
+        sheetResult.isSuccess
+      )
       assertTrue("Baris dan kelompok kolom harus dipaginasi", renderer.getPageCount(sheetPdf) > 2)
     } finally {
       converter.close()
