@@ -1,5 +1,6 @@
 package com.example.core.pdf
 
+import kotlinx.coroutines.sync.Mutex
 import java.io.File
 import java.io.FileInputStream
 import java.util.Locale
@@ -7,6 +8,28 @@ import java.util.Locale
 internal object PdfFileUtils {
     const val MAX_PDF_INPUT_BYTES: Long = 250L * 1024L * 1024L
     const val MAX_OFFICE_INPUT_BYTES: Long = 50L * 1024L * 1024L
+
+    /**
+     * [Audit fix — investigasi lanjutan kegagalan CI "document is closed!"]
+     *
+     * `android.graphics.pdf.PdfDocument` didokumentasikan resmi oleh Android sebagai
+     * "This class is not thread safe" dan memakai finalizer (CloseGuard) yang berjalan di
+     * "a single VM-wide finalizer thread" terpisah dari thread pemanggil. Sebelum perbaikan
+     * ini, TIDAK ADA satu pun sinkronisasi di seluruh modul `core.pdf` — enam fungsi di
+     * `PdfConverterEngine`, plus `PdfGenerator`, `PdfMergerSplitter`, `PdfRepairEngine`, dan
+     * `PdfCompressor`, semuanya membuat `PdfDocument()` sendiri-sendiri dan bisa saja berjalan
+     * BERSAMAAN dari coroutine berbeda (mis. pengguna memicu kompresi & penggabungan PDF di
+     * waktu yang sama) — ini bug konkurensi nyata yang independen dari lingkungan CI.
+     *
+     * Mutex tunggal ini menyerialkan SELURUH pemakaian `PdfDocument` di seluruh aplikasi
+     * (satu instance aktif pada satu waktu, proses demi proses). Ini adalah mitigasi yang
+     * defensif dan berbasis dokumentasi resmi API, bukan tebakan acak — tapi kejujurannya:
+     * ini BELUM bisa dipastikan 100% menyelesaikan kegagalan test "document is closed!" di
+     * Robolectric (lihat docs/AUDIT_REPORT.md), karena akar masalah pasti di lingkungan test
+     * tidak bisa diverifikasi lewat audit statis. Yang pasti: ini memperbaiki bug konkurensi
+     * nyata yang berlaku juga di device sungguhan, terlepas dari hasil CI berikutnya.
+     */
+    val pdfDocumentMutex = Mutex()
 
     private val invalidFileNameCharacters = Regex("[^a-zA-Z0-9._ -]")
 

@@ -5,6 +5,7 @@ import android.graphics.*
 import android.graphics.pdf.PdfDocument
 import com.example.core.model.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -26,6 +27,9 @@ class PdfGenerator(@Suppress("UNUSED_PARAMETER") context: Context) {
             require(quality.isFinite() && quality in 0.5f..2f) { "Kualitas PDF harus berada pada rentang 0.5-2.0" }
 
             PdfFileUtils.writeAtomically(outputFile, minimumBytes = 5L) { temporaryOutput ->
+              // [Audit fix] Diserialkan lewat PdfFileUtils.pdfDocumentMutex -- lihat
+              // PdfFileUtils.kt untuk alasan (PdfDocument didokumentasikan "not thread safe").
+              PdfFileUtils.pdfDocumentMutex.withLock {
                 val pdfDoc = PdfDocument()
                 try {
                     for ((index, page) in document.pages.withIndex()) {
@@ -178,6 +182,7 @@ class PdfGenerator(@Suppress("UNUSED_PARAMETER") context: Context) {
                 } finally {
                     pdfDoc.close()
                 }
+              }
             }
 
             Result.success(outputFile)

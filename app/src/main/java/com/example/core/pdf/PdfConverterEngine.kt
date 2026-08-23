@@ -6,6 +6,7 @@ import android.graphics.pdf.PdfDocument
 import android.media.ExifInterface
 import com.example.core.ocr.OcrEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.*
 import java.util.zip.ZipEntry
@@ -94,31 +95,35 @@ class PdfConverterEngine(
             imageFiles.forEach { PdfFileUtils.requireReadableFile(it, "Gambar '${it.name}'", PdfFileUtils.MAX_OFFICE_INPUT_BYTES) }
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
-                val pdfDoc = PdfDocument()
-                var pageIndex = 1
-                try {
-                    for (file in imageFiles) {
-                        val rawBitmap = decodeImageFile(file) ?: continue
-                        try {
-                            val bitmap = prepareOptimizedBitmapForPdf(rawBitmap)
+                // [Audit fix] Lihat PdfFileUtils.pdfDocumentMutex: PdfDocument tidak thread-safe
+                // menurut dokumentasi resmi Android, jadi seluruh siklus hidupnya diserialkan.
+                PdfFileUtils.pdfDocumentMutex.withLock {
+                    val pdfDoc = PdfDocument()
+                    var pageIndex = 1
+                    try {
+                        for (file in imageFiles) {
+                            val rawBitmap = decodeImageFile(file) ?: continue
                             try {
-                                val (pageW, pageH) = pdfPageSizePt(bitmap)
-                                val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, pageIndex++).create()
-                                val page = pdfDoc.startPage(pageInfo)
-                                page.canvas.drawBitmap(bitmap, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
-                                pdfDoc.finishPage(page)
+                                val bitmap = prepareOptimizedBitmapForPdf(rawBitmap)
+                                try {
+                                    val (pageW, pageH) = pdfPageSizePt(bitmap)
+                                    val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, pageIndex++).create()
+                                    val page = pdfDoc.startPage(pageInfo)
+                                    page.canvas.drawBitmap(bitmap, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
+                                    pdfDoc.finishPage(page)
+                                } finally {
+                                    if (bitmap !== rawBitmap && !bitmap.isRecycled) bitmap.recycle()
+                                }
                             } finally {
-                                if (bitmap !== rawBitmap && !bitmap.isRecycled) bitmap.recycle()
+                                if (!rawBitmap.isRecycled) rawBitmap.recycle()
                             }
-                        } finally {
-                            if (!rawBitmap.isRecycled) rawBitmap.recycle()
                         }
-                    }
 
-                    require(pageIndex > 1) { "Tidak ada gambar valid yang dapat diproses" }
-                    FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
-                } finally {
-                    pdfDoc.close()
+                        require(pageIndex > 1) { "Tidak ada gambar valid yang dapat diproses" }
+                        FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
+                    } finally {
+                        pdfDoc.close()
+                    }
                 }
             }
             Result.success(outputPdf)
@@ -149,24 +154,26 @@ class PdfConverterEngine(
             require(bitmaps.none { it.isRecycled || it.width <= 0 || it.height <= 0 }) { "Daftar berisi bitmap yang tidak valid" }
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
-                val pdfDoc = PdfDocument()
-                try {
-                    for ((index, sourceBitmap) in bitmaps.withIndex()) {
-                        val optimizedBitmap = prepareOptimizedBitmapForPdf(sourceBitmap)
-                        try {
-                            val (pageW, pageH) = pdfPageSizePt(optimizedBitmap)
-                            val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, index + 1).create()
-                            val page = pdfDoc.startPage(pageInfo)
-                            page.canvas.drawBitmap(optimizedBitmap, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
-                            pdfDoc.finishPage(page)
-                        } finally {
-                            if (optimizedBitmap !== sourceBitmap && !optimizedBitmap.isRecycled) optimizedBitmap.recycle()
-                            if (recycleSource && !sourceBitmap.isRecycled) sourceBitmap.recycle()
+                PdfFileUtils.pdfDocumentMutex.withLock {
+                    val pdfDoc = PdfDocument()
+                    try {
+                        for ((index, sourceBitmap) in bitmaps.withIndex()) {
+                            val optimizedBitmap = prepareOptimizedBitmapForPdf(sourceBitmap)
+                            try {
+                                val (pageW, pageH) = pdfPageSizePt(optimizedBitmap)
+                                val pageInfo = PdfDocument.PageInfo.Builder(pageW, pageH, index + 1).create()
+                                val page = pdfDoc.startPage(pageInfo)
+                                page.canvas.drawBitmap(optimizedBitmap, null, Rect(0, 0, pageW, pageH), pageDrawPaint)
+                                pdfDoc.finishPage(page)
+                            } finally {
+                                if (optimizedBitmap !== sourceBitmap && !optimizedBitmap.isRecycled) optimizedBitmap.recycle()
+                                if (recycleSource && !sourceBitmap.isRecycled) sourceBitmap.recycle()
+                            }
                         }
+                        FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
+                    } finally {
+                        pdfDoc.close()
                     }
-                    FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
-                } finally {
-                    pdfDoc.close()
                 }
             }
             Result.success(outputPdf)
@@ -196,40 +203,48 @@ class PdfConverterEngine(
         try {
             require(pageCount > 0) { "Dokumen tidak memiliki halaman" }
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
-                val pdfDoc = PdfDocument()
-                try {
-                    for (index in 0 until pageCount) {
-                        val generated = bitmapProvider(index)
-                        require(!generated.isRecycled && generated.width > 0 && generated.height > 0) {
-                            "Halaman ${index + 1} menghasilkan bitmap yang tidak valid"
-                        }
-                        try {
-                            val optimized = prepareOptimizedBitmapForPdf(generated)
-                            try {
-                                val (pageWidth, pageHeight) = pdfPageSizePt(optimized)
-                                val pageInfo = PdfDocument.PageInfo.Builder(
-                                    pageWidth,
-                                    pageHeight,
-                                    index + 1
-                                ).create()
-                                val page = pdfDoc.startPage(pageInfo)
-                                page.canvas.drawBitmap(
-                                    optimized,
-                                    null,
-                                    Rect(0, 0, pageWidth, pageHeight),
-                                    pageDrawPaint
-                                )
-                                pdfDoc.finishPage(page)
-                            } finally {
-                                if (optimized !== generated && !optimized.isRecycled) optimized.recycle()
+                // [Audit fix] Diserialkan lewat pdfDocumentMutex (lihat PdfFileUtils.kt) --
+                // CATATAN untuk pemelihara berikutnya: Mutex kotlinx.coroutines TIDAK reentrant.
+                // Jangan panggil fungsi lain yang juga mengambil pdfDocumentMutex (mis. fungsi
+                // pembuat PDF lain di kelas ini) dari dalam bitmapProvider, atau akan deadlock.
+                // bitmapProvider saat ini hanya diharapkan menghasilkan Bitmap murni (hasil
+                // scan/render), bukan memanggil balik fungsi PDF lain.
+                PdfFileUtils.pdfDocumentMutex.withLock {
+                    val pdfDoc = PdfDocument()
+                    try {
+                        for (index in 0 until pageCount) {
+                            val generated = bitmapProvider(index)
+                            require(!generated.isRecycled && generated.width > 0 && generated.height > 0) {
+                                "Halaman ${index + 1} menghasilkan bitmap yang tidak valid"
                             }
-                        } finally {
-                            if (!generated.isRecycled) generated.recycle()
+                            try {
+                                val optimized = prepareOptimizedBitmapForPdf(generated)
+                                try {
+                                    val (pageWidth, pageHeight) = pdfPageSizePt(optimized)
+                                    val pageInfo = PdfDocument.PageInfo.Builder(
+                                        pageWidth,
+                                        pageHeight,
+                                        index + 1
+                                    ).create()
+                                    val page = pdfDoc.startPage(pageInfo)
+                                    page.canvas.drawBitmap(
+                                        optimized,
+                                        null,
+                                        Rect(0, 0, pageWidth, pageHeight),
+                                        pageDrawPaint
+                                    )
+                                    pdfDoc.finishPage(page)
+                                } finally {
+                                    if (optimized !== generated && !optimized.isRecycled) optimized.recycle()
+                                }
+                            } finally {
+                                if (!generated.isRecycled) generated.recycle()
+                            }
                         }
+                        FileOutputStream(temporaryOutput).use { output -> pdfDoc.writeTo(output) }
+                    } finally {
+                        pdfDoc.close()
                     }
-                    FileOutputStream(temporaryOutput).use { output -> pdfDoc.writeTo(output) }
-                } finally {
-                    pdfDoc.close()
                 }
             }
             Result.success(outputPdf)
@@ -372,38 +387,40 @@ class PdfConverterEngine(
             val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
-                val pdfDoc = PdfDocument()
-                try {
-                    pdfRenderer.forEachRenderedPage(sourcePdf, scale = 1.6f) { index, bitmap ->
-                        val rotatedBitmap = Bitmap.createBitmap(
-                            bitmap,
-                            0,
-                            0,
-                            bitmap.width,
-                            bitmap.height,
-                            matrix,
-                            true
-                        )
-                        try {
-                            val originalPage = dimensions[index]
-                            val pageWidth = if (degrees == 180) originalPage.width else originalPage.height
-                            val pageHeight = if (degrees == 180) originalPage.height else originalPage.width
-                            val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, index + 1).create()
-                            val page = pdfDoc.startPage(pageInfo)
-                            page.canvas.drawBitmap(
-                                rotatedBitmap,
-                                null,
-                                Rect(0, 0, pageWidth, pageHeight),
-                                pageDrawPaint
+                PdfFileUtils.pdfDocumentMutex.withLock {
+                    val pdfDoc = PdfDocument()
+                    try {
+                        pdfRenderer.forEachRenderedPage(sourcePdf, scale = 1.6f) { index, bitmap ->
+                            val rotatedBitmap = Bitmap.createBitmap(
+                                bitmap,
+                                0,
+                                0,
+                                bitmap.width,
+                                bitmap.height,
+                                matrix,
+                                true
                             )
-                            pdfDoc.finishPage(page)
-                        } finally {
-                            if (rotatedBitmap !== bitmap && !rotatedBitmap.isRecycled) rotatedBitmap.recycle()
+                            try {
+                                val originalPage = dimensions[index]
+                                val pageWidth = if (degrees == 180) originalPage.width else originalPage.height
+                                val pageHeight = if (degrees == 180) originalPage.height else originalPage.width
+                                val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, index + 1).create()
+                                val page = pdfDoc.startPage(pageInfo)
+                                page.canvas.drawBitmap(
+                                    rotatedBitmap,
+                                    null,
+                                    Rect(0, 0, pageWidth, pageHeight),
+                                    pageDrawPaint
+                                )
+                                pdfDoc.finishPage(page)
+                            } finally {
+                                if (rotatedBitmap !== bitmap && !rotatedBitmap.isRecycled) rotatedBitmap.recycle()
+                            }
                         }
+                        FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
+                    } finally {
+                        pdfDoc.close()
                     }
-                    FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
-                } finally {
-                    pdfDoc.close()
                 }
             }
             Result.success(outputPdf)
@@ -652,34 +669,36 @@ class PdfConverterEngine(
                 .flatMap { wrapTextLine(it, textPaint, usableWidth) }
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
-                val pdfDoc = PdfDocument()
-                try {
-                    var lineIndex = 0
-                    var pageIndex = 0
-                    do {
-                        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageIndex + 1).create()
-                        val page = pdfDoc.startPage(pageInfo)
-                        val canvas = page.canvas
-                        canvas.drawColor(Color.WHITE)
+                PdfFileUtils.pdfDocumentMutex.withLock {
+                    val pdfDoc = PdfDocument()
+                    try {
+                        var lineIndex = 0
+                        var pageIndex = 0
+                        do {
+                            val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageIndex + 1).create()
+                            val page = pdfDoc.startPage(pageInfo)
+                            val canvas = page.canvas
+                            canvas.drawColor(Color.WHITE)
 
-                        var y = margin
-                        if (pageIndex == 0) {
-                            canvas.drawText(title.take(80), margin, y + 20f, titlePaint)
-                            y += 50f
-                        }
+                            var y = margin
+                            if (pageIndex == 0) {
+                                canvas.drawText(title.take(80), margin, y + 20f, titlePaint)
+                                y += 50f
+                            }
 
-                        while (lineIndex < wrappedLines.size && y <= pageHeight - margin) {
-                            val line = wrappedLines[lineIndex++]
-                            if (line.isNotEmpty()) canvas.drawText(line, margin, y, textPaint)
-                            y += 20f
-                        }
-                        pdfDoc.finishPage(page)
-                        pageIndex++
-                    } while (lineIndex < wrappedLines.size)
+                            while (lineIndex < wrappedLines.size && y <= pageHeight - margin) {
+                                val line = wrappedLines[lineIndex++]
+                                if (line.isNotEmpty()) canvas.drawText(line, margin, y, textPaint)
+                                y += 20f
+                            }
+                            pdfDoc.finishPage(page)
+                            pageIndex++
+                        } while (lineIndex < wrappedLines.size)
 
-                    FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
-                } finally {
-                    pdfDoc.close()
+                        FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
+                    } finally {
+                        pdfDoc.close()
+                    }
                 }
             }
             Result.success(outputPdf)
@@ -838,54 +857,56 @@ class PdfConverterEngine(
             }
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
-                val pdfDoc = PdfDocument()
-                try {
-                    var pageNumber = 1
-                    for (columns in columnGroups) {
-                        for (rows in rowGroups) {
-                            val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
-                            val page = pdfDoc.startPage(pageInfo)
-                            val canvas = page.canvas
-                            canvas.drawColor(Color.WHITE)
-                            canvas.drawText(title.take(80), margin, margin + 15f, titlePaint)
-                            if (columnGroups.size > 1) {
-                                canvas.drawText(
-                                    "Kolom ${columns.first() + 1}-${columns.last() + 1} • Halaman $pageNumber",
-                                    margin,
-                                    margin + 35f,
-                                    cellPaint
-                                )
-                            }
-
-                            val colWidth = (pageWidth - margin * 2) / columns.size.coerceAtLeast(1)
-                            var currentY = margin + 48f
-                            val pageRows = listOf(header) + rows
-                            for ((rowIndex, row) in pageRows.withIndex()) {
-                                for ((visibleColumnIndex, sourceColumnIndex) in columns.withIndex()) {
-                                    val left = margin + visibleColumnIndex * colWidth
-                                    val top = currentY
-                                    if (rowIndex == 0) {
-                                        canvas.drawRect(left, top, left + colWidth, top + cellHeight, headerBg)
-                                    }
-                                    canvas.drawRect(left, top, left + colWidth, top + cellHeight, borderPaint)
-                                    val value = row.getOrNull(sourceColumnIndex).orEmpty()
+                PdfFileUtils.pdfDocumentMutex.withLock {
+                    val pdfDoc = PdfDocument()
+                    try {
+                        var pageNumber = 1
+                        for (columns in columnGroups) {
+                            for (rows in rowGroups) {
+                                val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageNumber).create()
+                                val page = pdfDoc.startPage(pageInfo)
+                                val canvas = page.canvas
+                                canvas.drawColor(Color.WHITE)
+                                canvas.drawText(title.take(80), margin, margin + 15f, titlePaint)
+                                if (columnGroups.size > 1) {
                                     canvas.drawText(
-                                        ellipsize(value, cellPaint, colWidth - 12f),
-                                        left + 6f,
-                                        top + 18f,
+                                        "Kolom ${columns.first() + 1}-${columns.last() + 1} • Halaman $pageNumber",
+                                        margin,
+                                        margin + 35f,
                                         cellPaint
                                     )
                                 }
-                                currentY += cellHeight
-                            }
-                            pdfDoc.finishPage(page)
-                            pageNumber++
-                        }
-                    }
 
-                    FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
-                } finally {
-                    pdfDoc.close()
+                                val colWidth = (pageWidth - margin * 2) / columns.size.coerceAtLeast(1)
+                                var currentY = margin + 48f
+                                val pageRows = listOf(header) + rows
+                                for ((rowIndex, row) in pageRows.withIndex()) {
+                                    for ((visibleColumnIndex, sourceColumnIndex) in columns.withIndex()) {
+                                        val left = margin + visibleColumnIndex * colWidth
+                                        val top = currentY
+                                        if (rowIndex == 0) {
+                                            canvas.drawRect(left, top, left + colWidth, top + cellHeight, headerBg)
+                                        }
+                                        canvas.drawRect(left, top, left + colWidth, top + cellHeight, borderPaint)
+                                        val value = row.getOrNull(sourceColumnIndex).orEmpty()
+                                        canvas.drawText(
+                                            ellipsize(value, cellPaint, colWidth - 12f),
+                                            left + 6f,
+                                            top + 18f,
+                                            cellPaint
+                                        )
+                                    }
+                                    currentY += cellHeight
+                                }
+                                pdfDoc.finishPage(page)
+                                pageNumber++
+                            }
+                        }
+
+                        FileOutputStream(temporaryOutput).use { out -> pdfDoc.writeTo(out) }
+                    } finally {
+                        pdfDoc.close()
+                    }
                 }
             }
             Result.success(outputPdf)

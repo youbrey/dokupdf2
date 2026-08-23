@@ -6,6 +6,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -48,6 +49,9 @@ class PdfCompressor(
             require(dimensions.isNotEmpty()) { "PDF tidak memiliki halaman yang dapat dikompresi" }
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
+              // [Audit fix] Diserialkan lewat PdfFileUtils.pdfDocumentMutex -- lihat
+              // PdfFileUtils.kt untuk alasan (PdfDocument didokumentasikan "not thread safe").
+              PdfFileUtils.pdfDocumentMutex.withLock {
                 val pdfDoc = PdfDocument()
                 try {
                     rendererEngine.forEachRenderedPage(sourcePdf, scale = level.scaleFactor) { index, bmp ->
@@ -92,6 +96,7 @@ class PdfCompressor(
                 if (temporaryOutput.length() >= originalSize) {
                     sourcePdf.copyTo(temporaryOutput, overwrite = true)
                 }
+              }
             }
 
             val compressedSize = outputPdf.length()

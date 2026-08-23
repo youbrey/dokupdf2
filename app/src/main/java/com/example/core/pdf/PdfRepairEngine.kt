@@ -5,6 +5,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
@@ -66,6 +67,9 @@ class PdfRepairEngine(
             val dimensions = rendererEngine.getPageDimensions(renderSource)
 
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
+              // [Audit fix] Diserialkan lewat PdfFileUtils.pdfDocumentMutex -- lihat
+              // PdfFileUtils.kt untuk alasan (PdfDocument didokumentasikan "not thread safe").
+              PdfFileUtils.pdfDocumentMutex.withLock {
                 val cleanDocument = PdfDocument()
                 try {
                     rendererEngine.forEachRenderedPage(renderSource, scale = 1.6f) { pageIndex, bitmap ->
@@ -88,8 +92,19 @@ class PdfRepairEngine(
                 } finally {
                     cleanDocument.close()
                 }
+              }
             }
-            fixedIssues += "Membangun ulang struktur xref dan object dictionary (${dimensions.size} halaman)"
+            fixedIssues += "Merender ulang setiap halaman sebagai gambar ke dokumen PDF baru (${dimensions.size} halaman)"
+            // [Audit fix] Pesan sebelumnya ("Membangun ulang struktur xref dan object
+            // dictionary") menyiratkan perbaikan struktural PDF asli (mis. xref table, object
+            // stream) tetap dipertahankan -- itu TIDAK BENAR. Proses ini merender ulang setiap
+            // halaman menjadi bitmap lalu menuliskannya sebagai halaman gambar baru (sama
+            // seperti fungsi lain di kelas ini). Konsekuensi nyata bagi pengguna: teks yang
+            // bisa diseleksi/dicari di PDF asli akan HILANG (jadi gambar), ukuran berkas bisa
+            // membesar signifikan. Ini bukan bug baru -- perilakunya sama sejak awal -- tapi
+            // pesannya sebelumnya menyesatkan tentang APA yang sebenarnya terjadi. TODO 🟡:
+            // pertimbangkan perbaikan xref/object dictionary asli (parsing PDF level rendah)
+            // sebagai fitur terpisah untuk kasus PDF besar bertext yang ingin dipertahankan.
 
             Result.success(
                 RepairReport(

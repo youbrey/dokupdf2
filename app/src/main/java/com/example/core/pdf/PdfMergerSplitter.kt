@@ -5,6 +5,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.pdf.PdfDocument
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -33,6 +34,9 @@ class PdfMergerSplitter(context: Context) {
             }
 
             PdfFileUtils.writeAtomically(outputFile, minimumBytes = 5L) { temporaryOutput ->
+              // [Audit fix] Diserialkan lewat PdfFileUtils.pdfDocumentMutex -- lihat
+              // PdfFileUtils.kt untuk alasan (PdfDocument didokumentasikan "not thread safe").
+              PdfFileUtils.pdfDocumentMutex.withLock {
                 val mergedPdf = PdfDocument()
                 var globalPageIndex = 1
                 try {
@@ -63,6 +67,7 @@ class PdfMergerSplitter(context: Context) {
                 } finally {
                     mergedPdf.close()
                 }
+              }
             }
             Result.success(outputFile)
         } catch (e: Exception) {
@@ -80,6 +85,10 @@ class PdfMergerSplitter(context: Context) {
         outputDir: File,
         pagesPerSplit: Int = 1
     ): Result<List<File>> = withContext(Dispatchers.IO) {
+      // [Audit fix] Diserialkan lewat PdfFileUtils.pdfDocumentMutex -- fungsi ini membuka
+      // beberapa PdfDocument berurutan (satu per bagian hasil split) sepanjang eksekusinya,
+      // jadi seluruh badan fungsi dikunci, bukan cuma satu writeAtomically saja.
+      PdfFileUtils.pdfDocumentMutex.withLock {
         val resultFiles = mutableListOf<File>()
         var activeDocument: PdfDocument? = null
         try {
@@ -153,5 +162,6 @@ class PdfMergerSplitter(context: Context) {
             resultFiles.forEach { it.delete() }
             Result.failure(IllegalStateException("Memori tidak cukup untuk memisahkan PDF", oom))
         }
+      }
     }
 }
