@@ -90,6 +90,21 @@ fun InteractiveCropScreen(
 
     var activeHandle by remember { mutableStateOf(HandleType.NONE) }
     var displayedImageBounds by remember { mutableStateOf(Rect.Zero) }
+    // Tracks whether workingBitmap's ownership was handed off via onCropConfirmed, so the
+    // cleanup below (BUG FIX: leaked rotated bitmap when the user backs out without confirming)
+    // never recycles a bitmap the caller is now displaying/relying on.
+    var workingBitmapOwnershipTransferred by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            if (!workingBitmapOwnershipTransferred &&
+                workingBitmap !== initialBitmap &&
+                !workingBitmap.isRecycled
+            ) {
+                workingBitmap.recycle()
+            }
+        }
+    }
 
     fun detectEdges(bitmap: Bitmap = workingBitmap) {
         scope.launch {
@@ -115,6 +130,17 @@ fun InteractiveCropScreen(
                     Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
                 }
                 workingBitmap = rotated
+                // BUG FIX (leaked full-resolution bitmap per rotate tap -> cumulative OOM crash
+                // on a later capture): `source` was replaced by `rotated` above with no recycle,
+                // so every "Kiri"/"Kanan" tap during a re-crop silently held onto a full-res
+                // ARGB_8888 copy of the page for the rest of the scanner session. `source` is
+                // only ever this screen's *own* previously-rotated copy or the caller's
+                // `initialBitmap` -- recycling it here is safe as long as we never recycle the
+                // original `initialBitmap` the caller still owns if the user backs out without
+                // confirming (guarded by the `source !== initialBitmap` check).
+                if (rotated !== source && source !== initialBitmap && !source.isRecycled) {
+                    source.recycle()
+                }
                 cropGeometry = withContext(Dispatchers.Default) {
                     detectCropGeometry(rotated, "Interactive crop rotation")
                 }
@@ -222,6 +248,10 @@ fun InteractiveCropScreen(
                                         FilterProcessor.cropPerspective(workingBitmap, cropGeometry)
                                     }
                                     isProcessing = false
+                                    // Ownership of workingBitmap passes to the caller from this point on
+                                    // (it becomes the page's new originalBitmap) -- the dispose cleanup
+                                    // above must not recycle it out from under that new owner.
+                                    workingBitmapOwnershipTransferred = true
                                     onCropConfirmed(cropped, cropGeometry, workingBitmap)
                                 } catch (oom: OutOfMemoryError) {
                                     Log.e("DokuPdfCrop", "Memori tidak cukup untuk crop perspektif", oom)

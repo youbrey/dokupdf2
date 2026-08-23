@@ -598,6 +598,30 @@ fun ScannerScreen(
                         croppedBitmap = null
                     )
                     if (croppedBmp !== rotatedBmp && !croppedBmp.isRecycled) croppedBmp.recycle()
+                    // BUG FIX (leaked full-resolution bitmap per re-crop -> cumulative OOM crash on
+                    // a later capture): the page's old originalBitmap/croppedBitmap are fully
+                    // replaced above but were never recycled, so every "Potong Ulang" confirm held
+                    // onto an extra full-resolution ARGB_8888 copy for the rest of the session.
+                    // Only recycle bitmaps that are genuinely orphaned by this update -- never one
+                    // that's still referenced by the new page state (rotatedBmp/geometry above), and
+                    // never a bitmap another page might still share a reference to.
+                    val orphanedOriginal = previous.originalBitmap
+                    if (orphanedOriginal !== rotatedBmp &&
+                        orphanedOriginal !== croppedBmp &&
+                        !orphanedOriginal.isRecycled &&
+                        scannedPages.none { it.originalBitmap === orphanedOriginal }
+                    ) {
+                        orphanedOriginal.recycle()
+                    }
+                    val orphanedCropped = previous.croppedBitmap
+                    if (orphanedCropped != null &&
+                        orphanedCropped !== rotatedBmp &&
+                        orphanedCropped !== croppedBmp &&
+                        !orphanedCropped.isRecycled &&
+                        scannedPages.none { it.croppedBitmap === orphanedCropped }
+                    ) {
+                        orphanedCropped.recycle()
+                    }
                 }
                 cropTargetPageIndex = null
             }
