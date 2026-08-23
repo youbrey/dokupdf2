@@ -58,14 +58,24 @@ object FilterProcessor {
     }
 
     private fun applyAutoEnhance(source: Bitmap): Bitmap {
+        // PERF FIX: this used to call Bitmap.getPixel(x, y) once per sample -- each call is a
+        // separate JNI round-trip into the native bitmap, so at a 320px sampling grid on a
+        // ~3000px-wide scan that was several thousand individual native calls on every single
+        // default-mode capture. A single bulk getPixels() read of the sampled rows is the same
+        // data with one native call per row instead of one per pixel.
         val sampleStep = max(1, max(source.width, source.height) / 320)
         var lumaSum = 0.0
         var lumaSquareSum = 0.0
         var chromaSum = 0.0
         var samples = 0
+        // One bulk row read per sampled y (native call), then sample every sampleStep-th column
+        // out of that row in plain CPU-side array indexing -- keeps the exact same sparse grid
+        // of sample points as the original per-pixel version, just without a native call per point.
+        val rowBuffer = IntArray(source.width)
         for (y in 0 until source.height step sampleStep) {
+            source.getPixels(rowBuffer, 0, source.width, 0, y, source.width, 1)
             for (x in 0 until source.width step sampleStep) {
-                val color = source.getPixel(x, y)
+                val color = rowBuffer[x]
                 val red = Color.red(color)
                 val green = Color.green(color)
                 val blue = Color.blue(color)
