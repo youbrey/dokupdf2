@@ -8,6 +8,7 @@ import com.example.core.pdf.OfficeFileParser
 import com.example.core.pdf.PdfConverterEngine
 import com.example.core.pdf.PdfFileUtils
 import com.example.core.pdf.PdfRendererEngine
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -173,7 +174,11 @@ class OfficeFileParserTest {
   @Test
   fun `lazy bitmap PDF conversion releases each generated page`() = runTest {
     val output = File.createTempFile("lazy-pages", ".pdf", context.cacheDir)
-    val converter = PdfConverterEngine(context)
+    // [Audit fix -- babak 2] Dispatchers.Unconfined menjaga PdfDocument/startPage/finishPage
+    // tetap berjalan di thread test yang sama (bukan thread pool Dispatchers.IO sungguhan)
+    // -- lihat catatan lengkap di PdfConverterEngine.kt kenapa ini perlu untuk
+    // @GraphicsMode(NATIVE) di Robolectric. Produksi tetap pakai Dispatchers.IO (default).
+    val converter = PdfConverterEngine(context, ioDispatcher = Dispatchers.Unconfined)
     var previous: Bitmap? = null
     try {
       val result = converter.generatedBitmapsToPdf(6, output) { index ->
@@ -206,7 +211,8 @@ class OfficeFileParserTest {
   fun `word and wide spreadsheet conversion paginate instead of truncating`() = runTest {
     val wordPdf = File.createTempFile("word-pages", ".pdf", context.cacheDir)
     val sheetPdf = File.createTempFile("sheet-pages", ".pdf", context.cacheDir)
-    val converter = PdfConverterEngine(context)
+    // [Audit fix -- babak 2] Lihat catatan di test sebelumnya di atas soal Dispatchers.Unconfined.
+    val converter = PdfConverterEngine(context, ioDispatcher = Dispatchers.Unconfined)
     val renderer = PdfRendererEngine(context)
     try {
       val wordLines = (1..140).map { "Baris $it berisi teks panjang yang tetap harus masuk ke dokumen hasil." }
