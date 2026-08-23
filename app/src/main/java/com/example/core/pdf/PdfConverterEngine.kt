@@ -122,10 +122,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk mengonversi gambar ke PDF", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -164,10 +170,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(Exception("Memori tidak cukup untuk membuat PDF. Coba kurangi jumlah halaman atau nonaktifkan mode kualitas HD.", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -221,10 +233,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputPdf)
-        } catch (error: Exception) {
-            Result.failure(error)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk membuat PDF hasil pindai", oom))
+        } catch (error: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${error.message}", error)
+
+            Result.failure(error)
         }
     }
 
@@ -258,12 +276,18 @@ class PdfConverterEngine(
             }
             require(files.isNotEmpty()) { "Tidak ada halaman yang dapat dirender dari PDF" }
             Result.success(files)
-        } catch (e: Exception) {
-            files.forEach { it.delete() }
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             files.forEach { it.delete() }
             Result.failure(IllegalStateException("Memori tidak cukup untuk mengekstrak halaman PDF", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            files.forEach { it.delete() }
+            Result.failure(e)
         }
     }
 
@@ -318,10 +342,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputFile)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk membuat gambar panjang", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -377,10 +407,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk memutar PDF", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -421,10 +457,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(resultText)
-        } catch (error: Exception) {
-            Result.failure(error)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk mengekstrak teks PDF", oom))
+        } catch (error: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${error.message}", error)
+
+            Result.failure(error)
         }
     }
 
@@ -460,10 +502,16 @@ class PdfConverterEngine(
                 writeValidDocxZip(temporaryOutput, sourcePdf.nameWithoutExtension, extractedTextList)
             }
             Result.success(outputDocxFile)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk mengonversi PDF ke DOCX", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -562,10 +610,16 @@ class PdfConverterEngine(
             val lines = OfficeFileParser.readWordLines(sourceFile)
             val title = sourceFile.nameWithoutExtension
             wordLinesToPdf(lines, title, outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk membaca dokumen Word/Teks", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -629,10 +683,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk membuat PDF dari dokumen teks", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -685,10 +745,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputCsvFile)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk mengekstrak PDF ke CSV", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -704,10 +770,16 @@ class PdfConverterEngine(
             val tableRows = OfficeFileParser.readSpreadsheet(sourceFile)
             val title = sourceFile.nameWithoutExtension
             excelRowsToPdf(tableRows, title, outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk membaca spreadsheet", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
@@ -817,10 +889,16 @@ class PdfConverterEngine(
                 }
             }
             Result.success(outputPdf)
-        } catch (e: Exception) {
-            Result.failure(e)
         } catch (oom: OutOfMemoryError) {
             Result.failure(IllegalStateException("Memori tidak cukup untuk membuat PDF spreadsheet", oom))
+        } catch (e: Throwable) {
+            // [Audit fix] Sebelumnya hanya menangkap Exception -- Error/AssertionError
+            // lolos begitu saja dari kontrak Result<File> ini. Sekarang semua Throwable
+            // ditangkap, dan stack trace lengkap dicatat untuk diagnosis kegagalan
+            // (lihat docs/AUDIT_REPORT.md soal kegagalan test 'document is closed!').
+            android.util.Log.e("PdfConverterEngine", "Konversi PDF gagal: ${e.message}", e)
+
+            Result.failure(e)
         }
     }
 
