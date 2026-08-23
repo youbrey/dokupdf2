@@ -1,10 +1,13 @@
 name: Build Android APK
 
+# [Perubahan] Sebelumnya workflow ini juga terpicu otomatis lewat `push` dan
+# `pull_request` ke branch main. Sekarang HANYA bisa dijalankan manual lewat
+# tab Actions -> "Build Android APK" -> "Run workflow" (workflow_dispatch).
+# Alasan lazim untuk ini: menghemat kuota menit CI, atau menghindari build
+# APK debug otomatis di setiap commit/PR selama masih tahap audit/perbaikan
+# aktif. Kembalikan blok `push:`/`pull_request:` di bawah kalau nanti mau
+# balik ke trigger otomatis.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       build_type:
