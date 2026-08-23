@@ -13,9 +13,13 @@ import java.io.FileOutputStream
 /**
  * Handles merging multiple PDF files and splitting PDF pages into individual documents
  */
-class PdfMergerSplitter(context: Context) {
+class PdfMergerSplitter(
+    context: Context,
+    // [Audit fix -- babak 2] Lihat catatan lengkap di PdfConverterEngine.kt.
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO
+) {
 
-    private val rendererEngine = PdfRendererEngine(context)
+    private val rendererEngine = PdfRendererEngine(context, ioDispatcher)
 
     /**
      * Merges multiple PDF files into one combined PDF
@@ -23,7 +27,7 @@ class PdfMergerSplitter(context: Context) {
     suspend fun mergePdfs(
         pdfFiles: List<File>,
         outputFile: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(pdfFiles.size >= 2) { "Pilih setidaknya dua PDF untuk digabungkan" }
             val distinctFiles = pdfFiles.distinctBy { it.canonicalPath }
@@ -84,7 +88,7 @@ class PdfMergerSplitter(context: Context) {
         sourcePdf: File,
         outputDir: File,
         pagesPerSplit: Int = 1
-    ): Result<List<File>> = withContext(Dispatchers.IO) {
+    ): Result<List<File>> = withContext(ioDispatcher) {
       // [Audit fix] Diserialkan lewat PdfFileUtils.pdfDocumentMutex -- fungsi ini membuka
       // beberapa PdfDocument berurutan (satu per bagian hasil split) sepanjang eksekusinya,
       // jadi seluruh badan fungsi dikunci, bukan cuma satu writeAtomically saja.

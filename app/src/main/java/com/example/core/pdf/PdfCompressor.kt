@@ -33,14 +33,17 @@ data class CompressionResult(
 
 class PdfCompressor(
     context: Context,
-    private val rendererEngine: PdfRendererEngine = PdfRendererEngine(context)
+    // [Audit fix -- babak 2] Lihat catatan lengkap di PdfConverterEngine.kt. Dipindah
+    // sebelum rendererEngine supaya defaultnya bisa meneruskan dispatcher yang sama.
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
+    private val rendererEngine: PdfRendererEngine = PdfRendererEngine(context, ioDispatcher)
 ) {
 
     suspend fun compressPdf(
         sourcePdf: File,
         outputPdf: File,
         level: CompressionLevel = CompressionLevel.HIGH
-    ): Result<CompressionResult> = withContext(Dispatchers.IO) {
+    ): Result<CompressionResult> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requirePdf(sourcePdf)
             PdfFileUtils.requireDistinct(sourcePdf, outputPdf)

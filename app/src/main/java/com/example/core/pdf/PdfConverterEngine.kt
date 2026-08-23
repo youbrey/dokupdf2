@@ -18,8 +18,23 @@ import java.util.zip.ZipOutputStream
  */
 class PdfConverterEngine(
     context: Context,
-    private val pdfRenderer: PdfRendererEngine = PdfRendererEngine(context),
-    suppliedOcrEngine: OcrEngine? = null
+    suppliedOcrEngine: OcrEngine? = null,
+    // [Audit fix -- babak 2] Sebelumnya SETIAP fungsi hardcode `withContext(Dispatchers.IO)`.
+    // Mutex (PdfFileUtils.pdfDocumentMutex) TERBUKTI TIDAK memperbaiki kegagalan test
+    // "document is closed!" di Robolectric (stack trace identik setelah mutex diterapkan --
+    // lihat docs/AUDIT_REPORT.md) -- artinya ini bukan bug konkurensi/race seperti dugaan
+    // awal. Bukti dari komunitas Robolectric (mis. artikel "How to Solve Flaky Robolectric
+    // and Roborazzi Tests") mengonfirmasi pola persis ini: memakai `Dispatchers.IO` (thread
+    // pool nyata) di dalam test `@GraphicsMode(NATIVE)` membuat kode native-graphics
+    // berjalan di thread YANG TIDAK dikontrol Robolectric, dan solusi standarnya adalah
+    // meng-inject dispatcher-nya. Default tetap `Dispatchers.IO` (perilaku device asli
+    // TIDAK berubah) -- test sekarang bisa mensuplai `Dispatchers.Unconfined` supaya kode
+    // PDF-writing tetap berjalan di thread test yang sama, bukan thread pool terpisah.
+    // Dipindah SEBELUM `pdfRenderer` supaya nilai defaultnya bisa meneruskan dispatcher
+    // yang sama ke PdfRendererEngine (lihat PdfRendererEngine.kt -- dia punya masalah
+    // Dispatchers.IO yang identik untuk forEachRenderedPage/getPageCount/dst).
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
+    private val pdfRenderer: PdfRendererEngine = PdfRendererEngine(context, ioDispatcher)
 ) {
 
     private companion object {
@@ -89,7 +104,7 @@ class PdfConverterEngine(
     suspend fun imagesToPdf(
         imageFiles: List<File>,
         outputPdf: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(imageFiles.isNotEmpty()) { "Pilih setidaknya satu gambar" }
             imageFiles.forEach { PdfFileUtils.requireReadableFile(it, "Gambar '${it.name}'", PdfFileUtils.MAX_OFFICE_INPUT_BYTES) }
@@ -148,7 +163,7 @@ class PdfConverterEngine(
         bitmaps: List<Bitmap>,
         outputPdf: File,
         recycleSource: Boolean = false
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(bitmaps.isNotEmpty()) { "Daftar gambar kosong" }
             require(bitmaps.none { it.isRecycled || it.width <= 0 || it.height <= 0 }) { "Daftar berisi bitmap yang tidak valid" }
@@ -199,7 +214,7 @@ class PdfConverterEngine(
         pageCount: Int,
         outputPdf: File,
         bitmapProvider: suspend (pageIndex: Int) -> Bitmap
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(pageCount > 0) { "Dokumen tidak memiliki halaman" }
             PdfFileUtils.writeAtomically(outputPdf, minimumBytes = 5L) { temporaryOutput ->
@@ -269,7 +284,7 @@ class PdfConverterEngine(
         outputDir: File,
         format: Bitmap.CompressFormat = Bitmap.CompressFormat.JPEG,
         quality: Int = 90
-    ): Result<List<File>> = withContext(Dispatchers.IO) {
+    ): Result<List<File>> = withContext(ioDispatcher) {
         val files = mutableListOf<File>()
         try {
             PdfFileUtils.requirePdf(sourcePdf)
@@ -312,7 +327,7 @@ class PdfConverterEngine(
     suspend fun pdfToLongImage(
         sourcePdf: File,
         outputFile: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requirePdf(sourcePdf)
             PdfFileUtils.requireDistinct(sourcePdf, outputFile)
@@ -377,7 +392,7 @@ class PdfConverterEngine(
         sourcePdf: File,
         outputPdf: File,
         degrees: Int
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requirePdf(sourcePdf)
             PdfFileUtils.requireDistinct(sourcePdf, outputPdf)
@@ -441,7 +456,7 @@ class PdfConverterEngine(
         sourcePdf: File,
         includePageHeaders: Boolean = true,
         maximumCharacters: Int = 80_000
-    ): Result<String> = withContext(Dispatchers.IO) {
+    ): Result<String> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requirePdf(sourcePdf)
             require(maximumCharacters in 1_000..500_000) { "Batas karakter ekstraksi tidak valid" }
@@ -493,7 +508,7 @@ class PdfConverterEngine(
     suspend fun pdfToDocx(
         sourcePdf: File,
         outputDocxFile: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requirePdf(sourcePdf)
             PdfFileUtils.requireDistinct(sourcePdf, outputDocxFile)
@@ -621,7 +636,7 @@ class PdfConverterEngine(
     suspend fun wordToPdf(
         sourceFile: File,
         outputPdf: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requireDistinct(sourceFile, outputPdf)
             val lines = OfficeFileParser.readWordLines(sourceFile)
@@ -644,7 +659,7 @@ class PdfConverterEngine(
         textLines: List<String>,
         title: String,
         outputPdf: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(title.isNotBlank()) { "Judul dokumen tidak boleh kosong" }
             require(textLines.sumOf { it.length.toLong() } <= MAX_CONVERTED_TEXT_CHARACTERS) {
@@ -721,7 +736,7 @@ class PdfConverterEngine(
     suspend fun pdfToExcel(
         sourcePdf: File,
         outputCsvFile: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requirePdf(sourcePdf)
             PdfFileUtils.requireDistinct(sourcePdf, outputCsvFile)
@@ -783,7 +798,7 @@ class PdfConverterEngine(
     suspend fun excelToPdf(
         sourceFile: File,
         outputPdf: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             PdfFileUtils.requireDistinct(sourceFile, outputPdf)
             val tableRows = OfficeFileParser.readSpreadsheet(sourceFile)
@@ -809,7 +824,7 @@ class PdfConverterEngine(
         tableRows: List<List<String>>,
         title: String,
         outputPdf: File
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(tableRows.isNotEmpty() && tableRows.any { row -> row.any { it.isNotBlank() } }) {
                 "Spreadsheet tidak memiliki data"

@@ -15,14 +15,20 @@ import java.io.File
 /**
  * High-performance PDF reader & page renderer using Android native PdfRenderer
  */
-class PdfRendererEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
+class PdfRendererEngine(
+    @Suppress("UNUSED_PARAMETER") context: Context,
+    // [Audit fix -- babak 2] Sama seperti PdfConverterEngine.kt: PdfRenderer/PdfDocument
+    // sensitif terhadap thread yang tidak dikontrol Robolectric di test @GraphicsMode(NATIVE).
+    // Default tetap Dispatchers.IO (device asli tidak berubah).
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO
+) {
 
     data class PageDimensions(val width: Int, val height: Int)
 
     suspend fun renderPdfPages(
         file: File,
         scale: Float = 2.0f
-    ): List<Bitmap> = withContext(Dispatchers.IO) {
+    ): List<Bitmap> = withContext(ioDispatcher) {
         validateScale(scale)
         PdfFileUtils.requirePdf(file)
         val bitmaps = mutableListOf<Bitmap>()
@@ -73,7 +79,7 @@ class PdfRendererEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
         file: File,
         pageIndex: Int,
         scale: Float = 2.0f
-    ): Bitmap? = withContext(Dispatchers.IO) {
+    ): Bitmap? = withContext(ioDispatcher) {
         validateScale(scale)
         var pfd: ParcelFileDescriptor? = null
         var renderer: PdfRenderer? = null
@@ -113,7 +119,7 @@ class PdfRendererEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
         }
     }
 
-    suspend fun getPageCount(file: File): Int = withContext(Dispatchers.IO) {
+    suspend fun getPageCount(file: File): Int = withContext(ioDispatcher) {
         var pfd: ParcelFileDescriptor? = null
         var renderer: PdfRenderer? = null
         try {
@@ -132,7 +138,7 @@ class PdfRendererEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
         }
     }
 
-    suspend fun getPageDimensions(file: File): List<PageDimensions> = withContext(Dispatchers.IO) {
+    suspend fun getPageDimensions(file: File): List<PageDimensions> = withContext(ioDispatcher) {
         var pfd: ParcelFileDescriptor? = null
         var renderer: PdfRenderer? = null
         try {
@@ -168,7 +174,7 @@ class PdfRendererEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
         file: File,
         scale: Float = 2.0f,
         action: suspend (pageIndex: Int, bitmap: Bitmap) -> Unit
-    ) = withContext(Dispatchers.IO) {
+    ) = withContext(ioDispatcher) {
         validateScale(scale)
         PdfFileUtils.requirePdf(file)
         var pfd: ParcelFileDescriptor? = null

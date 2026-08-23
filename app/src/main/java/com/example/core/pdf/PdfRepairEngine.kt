@@ -20,14 +20,17 @@ data class RepairReport(
 
 class PdfRepairEngine(
     context: Context,
-    private val rendererEngine: PdfRendererEngine = PdfRendererEngine(context)
+    // [Audit fix -- babak 2] Lihat catatan lengkap di PdfConverterEngine.kt. Dipindah
+    // sebelum rendererEngine supaya defaultnya bisa meneruskan dispatcher yang sama.
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
+    private val rendererEngine: PdfRendererEngine = PdfRendererEngine(context, ioDispatcher)
 ) {
     private val cacheDir = context.applicationContext.cacheDir
 
     suspend fun repairPdf(
         sourcePdf: File,
         outputPdf: File
-    ): Result<RepairReport> = withContext(Dispatchers.IO) {
+    ): Result<RepairReport> = withContext(ioDispatcher) {
         val fixedIssues = mutableListOf<String>()
         var tempFile: File? = null
         try {

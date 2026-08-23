@@ -13,7 +13,13 @@ import java.io.FileOutputStream
 /**
  * Generates standards-compliant PDF documents from DocumentModel state
  */
-class PdfGenerator(@Suppress("UNUSED_PARAMETER") context: Context) {
+class PdfGenerator(
+    @Suppress("UNUSED_PARAMETER") context: Context,
+    // [Audit fix -- babak 2] Lihat catatan lengkap di PdfConverterEngine.kt: mutex TIDAK
+    // memperbaiki "document is closed!" di Robolectric, sehingga dispatcher di-inject agar
+    // test bisa menjaga kode PdfDocument tetap di thread yang sama dengan test-nya.
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO
+) {
 
     private data class StyledFragment(val text: String, val run: TextRun)
 
@@ -21,7 +27,7 @@ class PdfGenerator(@Suppress("UNUSED_PARAMETER") context: Context) {
         document: DocumentModel,
         outputFile: File,
         quality: Float = 1.0f
-    ): Result<File> = withContext(Dispatchers.IO) {
+    ): Result<File> = withContext(ioDispatcher) {
         try {
             require(document.pages.isNotEmpty()) { "Dokumen tidak memiliki halaman" }
             require(quality.isFinite() && quality in 0.5f..2f) { "Kualitas PDF harus berada pada rentang 0.5-2.0" }
