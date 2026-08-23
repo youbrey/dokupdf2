@@ -1,5 +1,34 @@
 # DokuPDF - Project Changelog
 
+## [Unreleased] - 2026-08-23
+### Audit: Investigasi Kegagalan CI (`:app:testDebugUnitTest`)
+Build APK debug gagal di CI karena 2 dari 19 unit test gagal, keduanya di
+`OfficeFileParserTest` — satu-satunya file di project yang memakai
+`android.graphics.pdf.PdfDocument` untuk membuat dokumen **multi-halaman**.
+Rincian investigasi lengkap ada di `docs/AUDIT_REPORT.md` § Investigasi CI 2026-08-23.
+
+**Diperbaiki (pasti, terverifikasi lewat pembacaan kode):**
+- `PdfConverterEngine.kt` — 13 fungsi pembuat PDF sebelumnya hanya menangkap
+  `catch (e: Exception)`, sehingga `Error`/`AssertionError` (mis. dari `assertTrue`
+  di dalam callback pemanggil) lolos begitu saja dari kontrak `Result<File>` yang
+  dijanjikan API ini. Sekarang semua `Throwable` ditangkap secara eksplisit dan
+  dicatat lewat `Log.e` dengan stack trace lengkap.
+- `OfficeFileParserTest.kt` — pesan kegagalan assertion untuk hasil konversi PDF
+  sebelumnya hanya menampilkan `.message` (mis. `"document is closed!"`) tanpa
+  stack trace, sehingga baris kode persis yang melempar exception tidak pernah
+  terlihat di laporan test. Sekarang memakai `Log.getStackTraceString()` supaya
+  CI run berikutnya memberi info diagnosis yang jauh lebih lengkap.
+
+**BELUM diperbaiki — akar masalah "document is closed!" masih perlu diverifikasi:**
+Setelah audit mendalam (baca kode `generatedBitmapsToPdf`/`wordLinesToPdf` baris
+demi baris terhadap dokumentasi resmi `PdfDocument`), tidak ditemukan jalur logika
+aplikasi yang secara tekstual salah — urutan `startPage → finishPage → writeTo →
+close` sudah benar. Dugaan kuat: keterbatasan lingkungan Robolectric
+(`@GraphicsMode(NATIVE)`, API 34, versi 4.16.1) saat mensimulasikan `PdfDocument`
+multi-halaman — BUKAN dipastikan sebagai bug produksi. Perbaikan stack trace di
+atas dibuat justru supaya CI run berikutnya bisa memastikan ini secara pasti,
+bukan menebak.
+
 ## [1.0.0] - 2026-08-16
 ### Initial Release & Full Core Engine Implementation
 - **Custom Canvas Document Engine**:
