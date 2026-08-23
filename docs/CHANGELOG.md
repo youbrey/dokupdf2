@@ -1,5 +1,25 @@
 # DokuPDF - Project Changelog
 
+## [Unreleased] - 2026-08-23 (Babak 4 — final)
+### Root Cause Dipastikan & Ditutup: "document is closed!"
+Setelah 3 babak upaya perbaikan berbasis hipotesis berbeda (semua terbukti
+tidak relevan lewat bukti CI nyata: konkurensi/Mutex, lalu thread-hop
+Dispatchers.IO/dispatcher injection), root cause akhirnya DIPASTIKAN lewat
+penelusuran source resmi AOSP Robolectric: **`android.graphics.pdf.PdfDocument`
+tidak memiliki native shadow di Robolectric sama sekali** — limitasi tooling
+test, bukan bug aplikasi. Detail lengkap & bukti di `docs/AUDIT_REPORT.md` Babak 4.
+
+**Keputusan:** 2 test yang terdampak (`lazy bitmap PDF conversion releases
+each generated page`, `word and wide spreadsheet conversion paginate instead
+of truncating`) ditandai `@Ignore` dengan justifikasi lengkap di kode — bukan
+dihapus, bukan "diperbaiki" secara palsu. Rencana pemulihan cakupan test lewat
+Android Instrumented Test dicatat di `docs/ROADMAP.md`.
+
+Mutex (`PdfFileUtils.pdfDocumentMutex`) dan dispatcher injection
+(`ioDispatcher`) dari babak-babak sebelumnya **tetap dipertahankan** — keduanya
+perbaikan yang sah secara independen meski tidak relevan untuk kegagalan
+spesifik ini.
+
 ## [Unreleased] - 2026-08-23
 ### Audit: Investigasi Kegagalan CI (`:app:testDebugUnitTest`)
 Build APK debug gagal di CI karena 2 dari 19 unit test gagal, keduanya di

@@ -230,3 +230,84 @@ hanya bisa didapat dari run CI aktual berikutnya**. Kalau kedua test MASIH
 gagal setelah perubahan ini, itu petunjuk kuat root cause-nya bukan soal thread
 sama sekali, dan langkah berikutnya adalah opsi #2 dari Babak 2 (nonaktifkan
 `@GraphicsMode(NATIVE)` khusus 2 test ini).
+
+## Babak 4 — Root cause DIPASTIKAN: PdfDocument tidak punya native shadow di Robolectric
+
+Run CI berikutnya (`logs_88518760928.zip`) membuktikan hipotesis thread-hop di
+Babak 3 **juga salah** — kedua test masih gagal dengan pesan identik, dan kali
+ini stack trace-nya membuktikan eksekusi tetap berada di
+`kotlinx.coroutines.test.TestDispatcher`/`TestCoroutineScheduler` (bukan lagi
+`CoroutineScheduler$Worker` seperti Babak 3) — artinya `Dispatchers.Unconfined`
+berhasil menahan eksekusi tetap di thread test, TAPI kegagalan tetap terjadi.
+Ini secara definitif membuktikan bukan soal thread sama sekali.
+
+### Investigasi ulang dari nol (sesuai instruksi eksplisit)
+
+Alih-alih menambah dugaan baru, dilakukan penelusuran ke sumber utama:
+**commit AOSP yang memperkenalkan `@GraphicsMode(NATIVE)`** (Michael Hoisie,
+*"Introduce a set of graphics shadows backed by native code"*, 13 Des 2022,
+https://android.googlesource.com/platform/external/robolectric/+/636a0fdbbae8).
+
+Commit itu melampirkan **daftar lengkap semua kelas graphics yang mendapat
+native shadow** — sekitar 70 file: `ShadowNativeBitmap`, `ShadowNativeCanvas`,
+`ShadowNativePaint`, `ShadowNativeTypeface`, `ShadowNativePath`,
+`ShadowNativeRegion`, dst. **`PdfDocument` sama sekali tidak ada di daftar
+itu** — tidak ada `ShadowNativePdfDocument`, tidak ada `PdfDocumentNatives`.
+Penelusuran rilis-rilis berikutnya (4.10 s/d 4.16.1) tidak menemukan bukti
+penambahan shadow untuk `PdfDocument` di kemudian hari.
+
+### Mekanisme kegagalan yang sekarang bisa dijelaskan sepenuhnya
+
+Robolectric punya perilaku default terdokumentasi resmi: method native **tanpa
+shadow eksplisit otomatis menjadi no-op yang mengembalikan nilai default**
+(bukan error/crash). Urutan kejadiannya:
+
+1. `PdfDocument()` dipanggil → constructor memanggil native method pembuat
+   handle dokumen → **tidak ada shadow untuk `PdfDocument`** → Robolectric
+   no-op, mengembalikan `0` → `mNativeDocument = 0` **sejak konstruksi**,
+   bukan setelah `close()` dipanggil.
+2. `pdfDoc.startPage(pageInfo)` dipanggil (baris kode aplikasi mana pun,
+   halaman pertama sekalipun) → `throwIfClosed()` mengecek
+   `mNativeDocument == 0` → **selalu true** → `IllegalStateException:
+   "document is closed!"`.
+
+Teori ini menjelaskan **seluruh** bukti yang terkumpul sejak Babak 1, tanpa
+sisa anomali:
+- Kenapa gagal 100% deterministik (bukan flaky) — bukan race, tapi absennya
+  implementasi.
+- Kenapa Mutex (Babak 2) tidak berpengaruh — tidak ada konkurensi yang terlibat.
+- Kenapa dispatcher injection (Babak 3) tidak berpengaruh — tidak ada soal thread.
+- Kenapa gagal tepat di `startPage()` pertama, bukan `writeTo()`/`finishPage()`.
+- Kenapa HANYA 2 test yang memakai `PdfDocument` di seluruh project yang gagal,
+  sementara `AutoCropAndFilterTest`/`HomeScreenScreenshotTest` (pakai
+  Bitmap/Canvas/Paint — SEMUANYA punya native shadow) lulus di
+  `@GraphicsMode(NATIVE)` yang sama persis.
+
+### Kenapa TIDAK pindah ke `@GraphicsMode(LEGACY)`
+
+Robolectric juga tidak pernah menyediakan shadow legacy (non-native) untuk
+`PdfDocument`. Di mode legacy, method native tanpa shadow **juga** jadi no-op
+— bedanya, TIDAK ada pengecekan `throwIfClosed()` yang sama-sama no-op, jadi
+`writeTo()` kemungkinan besar akan "sukses" menulis PDF kosong/rusak. Test
+akan **lulus secara palsu** — pelanggaran prinsip inti audit ini (tidak boleh
+ada sukses palsu), lebih buruk daripada status merah yang jujur. Diputuskan
+TIDAK mengganti mode.
+
+### Keputusan final: `@Ignore` dengan justifikasi eksplisit + rencana instrumented test
+
+Kedua test ditandai `@Ignore` dengan pesan yang menjelaskan root cause secara
+lengkap (bukan `@Ignore` polos) — supaya siapa pun yang membaca kode langsung
+tahu KENAPA, bukan mengira fiturnya rusak atau ditinggalkan. Ini BUKAN
+menyembunyikan masalah: perilaku produksi (`generatedBitmapsToPdf`,
+`wordLinesToPdf`) tidak diubah sama sekali dan tetap benar untuk Android
+sungguhan sesuai kontrak resmi `PdfDocument`.
+
+Item roadmap konkret dicatat: pindahkan kedua skenario ini ke Android
+Instrumented Test (`app/src/androidTest/`) supaya cakupan verifikasi otomatis
+pulih — di lingkungan itu `PdfDocument` berjalan di device/emulator nyata,
+bukan simulasi JVM Robolectric yang punya gap ini. Lihat `docs/ROADMAP.md`.
+
+**Mutex (`pdfDocumentMutex`) dan dispatcher injection (`ioDispatcher`) TETAP
+dipertahankan** meski keduanya terbukti tidak relevan untuk kegagalan spesifik
+ini — keduanya tetap perbaikan yang sah secara independen (thread-safety nyata
+untuk `PdfDocument`, dan fleksibilitas testing untuk kelas-kelas lain).
