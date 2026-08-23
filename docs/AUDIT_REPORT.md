@@ -155,3 +155,78 @@ reentrant**. Jangan panggil fungsi pembuat-PDF lain (yang juga mengambil
   agar akurat. Perbaikan struktur PDF level-rendah yang sesungguhnya (parsing
   xref/object stream asli) belum diimplementasikan — dicatat sebagai TODO 🟡
   terpisah, bukan bug yang diperbaiki di babak ini.
+
+## Babak 3 — mutex TERBUKTI TIDAK cukup; root cause sebenarnya ditemukan
+
+Run CI berikutnya (`logs_88517272032.zip`, workflow sudah manual/`workflow_dispatch`
+sesuai permintaan) memberi bukti definitif: **kedua test masih gagal, dengan stack
+trace yang identik** (hanya nomor baris bergeser sedikit akibat kode mutex yang
+ditambahkan). Ini membuktikan hipotesis mutex di Babak 2 **salah** — bukan bug
+konkurensi/race, karena test ini berjalan sepenuhnya sekuensial (satu coroutine,
+tidak ada instance `PdfConverterEngine` lain yang aktif bersamaan) sehingga mutex
+tidak pernah benar-benar berkontensi di sini.
+
+### Bukti baru yang mengonfirmasi root cause sebenarnya
+
+Pencarian literatur komunitas Robolectric (artikel *"How to Solve Flaky Robolectric
+and Roborazzi Tests"*, dan berbagai open issue resmi `robolectric/robolectric` soal
+`GraphicsMode.NATIVE`) mengonfirmasi pola yang **persis cocok** dengan gejala di sini:
+
+> *"there will be threads in the app that aren't controlled during testing, which
+> also contributes to the tests' flakiness"* — dan solusi standar yang disebutkan
+> eksplisit: **"Injecting Coroutine Dispatchers: I replace the Default and IO
+> dispatchers with StandardTestDispatcher"**.
+
+Akar masalahnya: `withContext(Dispatchers.IO)` di dalam `runTest { }` **benar-benar
+berpindah ke thread pool nyata** (bukan scheduler waktu-virtual `TestDispatcher`
+milik `runTest`), sehingga kode `PdfDocument` (native graphics `@GraphicsMode.NATIVE`)
+dieksekusi di thread yang **tidak dikendalikan Robolectric** — persis kategori bug
+yang didokumentasikan komunitas sebagai penyebab utama flakiness jenis ini.
+
+### Perbaikan yang diterapkan: dependency-inject `ioDispatcher`
+
+Setiap kelas yang sebelumnya hardcode `withContext(Dispatchers.IO)` sekarang
+menerima parameter constructor `ioDispatcher: CoroutineDispatcher = Dispatchers.IO`
+(default tidak berubah — perilaku device asli identik):
+
+- `PdfConverterEngine.kt` (13 fungsi)
+- `PdfRendererEngine.kt` (5 fungsi — dipakai `forEachRenderedPage`/`getPageCount`/dst
+  oleh `PdfConverterEngine.rotatePdf()`, `PdfMergerSplitter`, `PdfRepairEngine`,
+  `PdfCompressor`)
+- `PdfGenerator.kt`, `PdfMergerSplitter.kt`, `PdfRepairEngine.kt`, `PdfCompressor.kt`
+
+Parameter `ioDispatcher` sengaja dideklarasikan **sebelum** `pdfRenderer`/
+`rendererEngine` di constructor masing-masing kelas, supaya nilai default
+`PdfRendererEngine(context, ioDispatcher)` bisa meneruskan dispatcher yang sama —
+satu rantai pemanggilan (mis. `rotatePdf()` yang memanggil `forEachRenderedPage()`
+di dalamnya) sekarang konsisten memakai satu dispatcher yang sama dari ujung ke ujung.
+
+Di `OfficeFileParserTest.kt`, kedua test yang gagal sekarang mengonstruksi
+`PdfConverterEngine(context, ioDispatcher = Dispatchers.Unconfined)` — menjaga
+seluruh kode `PdfDocument` tetap berjalan di thread test yang sama (tidak
+berpindah ke thread pool), alih-alih mengubah desain memory-efficient produksi.
+
+**Mutex dari Babak 2 (`PdfFileUtils.pdfDocumentMutex`) TETAP dipertahankan** —
+terbukti tidak menyelesaikan masalah SPESIFIK ini, tapi tetap sinkronisasi yang
+sah untuk melindungi `PdfDocument` (didokumentasikan resmi "not thread safe")
+dari race konkurensi nyata yang independen, yang bisa saja terjadi di device
+sungguhan meski tidak relevan untuk kegagalan test ini.
+
+### Cakupan yang SENGAJA tidak diubah
+
+`PdfComparer.kt`, `PdfSecurity.kt`, dan `DocumentRepository.kt` juga memakai
+`withContext(Dispatchers.IO)`, tapi tidak disentuh test manapun yang gagal saat
+ini (tidak ada assertion Robolectric NATIVE yang melibatkan kelas-kelas ini
+secara multi-halaman). Dibiarkan apa adanya untuk menjaga perubahan tetap
+berbasis bukti, bukan blanket-refactor spekulatif. **Kalau nanti ada test baru
+untuk kelas-kelas ini yang menunjukkan gejala serupa, terapkan pola yang sama
+(inject `ioDispatcher`, konstruksi dengan `Dispatchers.Unconfined` di test).**
+
+### Kejujuran soal kepastian (masih berlaku)
+
+Ini analisis berbasis bukti kuat (dokumentasi komunitas + kecocokan gejala
+persis), bukan tebakan — tapi seperti babak sebelumnya, **kepastian mutlak
+hanya bisa didapat dari run CI aktual berikutnya**. Kalau kedua test MASIH
+gagal setelah perubahan ini, itu petunjuk kuat root cause-nya bukan soal thread
+sama sekali, dan langkah berikutnya adalah opsi #2 dari Babak 2 (nonaktifkan
+`@GraphicsMode(NATIVE)` khusus 2 test ini).
