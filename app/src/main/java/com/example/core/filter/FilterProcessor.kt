@@ -165,7 +165,7 @@ object FilterProcessor {
                     val darkVal = ((ratio / paperThreshold) * 200f * (2.0f - contrastMultiplier)).toInt().coerceIn(100, 255)
                     val smoothVal = (darkVal + (255 - darkVal) * t).toInt().coerceIn(0, 255)
                     outPixels[rowOffset + x] = (0xFF shl 24) or (smoothVal shl 16) or (smoothVal shl 8) or smoothVal
-                } else if (chroma >= 22 || (b > r + 15 && b > g + 10)) {
+                } else if ((chroma >= 22 && !isWarmShadowCast(r, g, b)) || (b > r + 15 && b > g + 10)) {
                     // Color Element: Official blue stamps, ink signatures, red seals, colored headers
                     val normFactor = (255f / bg) * 1.05f * contrastMultiplier
                     var newR = (r * normFactor).toInt()
@@ -244,7 +244,7 @@ object FilterProcessor {
 
                 if (ratio >= paperThreshold && chroma < 20) {
                     outPixels[rowOffset + x] = 0xFFFFFFFF.toInt()
-                } else if (chroma >= 20 || (b > r + 12 && b > g + 8)) {
+                } else if ((chroma >= 20 && !isWarmShadowCast(r, g, b)) || (b > r + 12 && b > g + 8)) {
                     val normFactor = (255f / bg) * 1.1f * contrastMultiplier
                     var newR = (r * normFactor).toInt()
                     var newG = (g * normFactor).toInt()
@@ -764,6 +764,27 @@ object FilterProcessor {
 
         return result
     }
+
+    /**
+     * [Audit] Root-cause fix untuk hasil filter "Mempertajam"/"Magic Color"/"Otomatis" yang
+     * buruk pada foto ber-bayangan hangat (lighting indoor/kuning khas kamera HP tanpa
+     * flash — lihat perbandingan screenshot pengguna).
+     *
+     * Cabang "Color Element" di atas dimaksudkan untuk MEMPERTAHANKAN warna asli stempel
+     * biru/tanda tangan/materai merah (chroma tinggi = sengaja tidak diputihkan/dinormalisasi,
+     * malah saturasinya DINAIKKAN 1.4x). Masalahnya threshold `chroma >= 20/22` juga kena oleh
+     * bayangan kuning/hangat biasa — bayangan itu punya R dan G tinggi tapi B rendah, jadi
+     * chroma-nya gampang tembus 20-40 padahal itu SAMA SEKALI bukan stempel/tinta berwarna.
+     * Akibatnya: alih-alih diratakan ke putih seperti bayangan lain, bayangan kuning itu malah
+     * ikut dinaikkan saturasinya -> jadi noda kuning pekat yang justru lebih buruk dari aslinya.
+     *
+     * Fungsi ini mendeteksi pola "warm cast" itu secara spesifik: R DAN G sama-sama jauh di
+     * atas B (ciri khas bayangan kuning/oranye). Stempel MERAH sungguhan tidak match kondisi
+     * ini karena G-nya tetap rendah (hanya R yang tinggi, bukan R dan G berdua) — jadi tetap
+     * lolos sebagai elemen warna yang harus dipertahankan. Stempel/tinta BIRU sudah punya jalur
+     * deteksi terpisah (`b > r + ... && b > g + ...`) yang tidak disentuh fungsi ini sama sekali.
+     */
+    private fun isWarmShadowCast(r: Int, g: Int, b: Int): Boolean = r > b + 25 && g > b + 15
 
     private fun hypot(dx: Float, dy: Float): Float {
         return Math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
