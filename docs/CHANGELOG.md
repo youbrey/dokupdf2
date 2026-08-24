@@ -1,5 +1,21 @@
 # DokuPDF - Project Changelog
 
+## [Unreleased] - 2026-08-24
+### Fix: Filter "Mempertajam"/"Magic Color" merusak bayangan hangat jadi noda kuning
+Root cause: cabang "preserve warna stempel/tanda tangan" (`chroma >= 20/22` → saturasi
+dinaikkan 1.4x) salah mengklasifikasikan bayangan kuning/hangat khas foto indoor sebagai
+"tinta berwarna", karena bayangan seperti itu juga punya chroma tinggi. Ditambahkan
+`isWarmShadowCast()` di `FilterProcessor.kt` untuk mengecualikan pola warna itu secara
+spesifik dari cabang tersebut. Detail lengkap di `docs/AUDIT_REPORT.md`. Belum diverifikasi
+di device fisik.
+
+### Fix: Bingkai crop tidak bisa digeser sama sekali
+Root cause: `pointerInput` di `InteractiveCropScreen.kt` memakai `cropGeometry` sebagai key,
+padahal `cropGeometry` berubah di dalam gesture drag itu sendiri — menyebabkan
+`detectDragGestures` di-restart pada setiap gerakan jari sebelum sempat terdaftar sebagai
+drag berkelanjutan. `cropGeometry` dihapus dari key pointerInput. Detail di
+`docs/AUDIT_REPORT.md`.
+
 ## [Unreleased] - 2026-08-23 (Babak 4 — final)
 ### Root Cause Dipastikan & Ditutup: "document is closed!"
 Setelah 3 babak upaya perbaikan berbasis hipotesis berbeda (semua terbukti

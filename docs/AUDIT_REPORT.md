@@ -1,5 +1,54 @@
 # DokuPDF — Laporan Audit
 
+## Investigasi Laporan Pengguna 2026-08-24 — Filter "Mempertajam" Buruk & Crop Tidak Bisa Digeser
+
+**Input:** 2 screenshot perbandingan (CamScanner vs DokuPDF pada dokumen yang sama,
+berbayangan hangat/indoor) + laporan langsung: filter hasil "sangat buruk" dan bingkai
+crop "tidak bisa digeser/diatur" sama sekali (CamScanner bisa).
+
+### 1. Bug crop — root cause ditemukan di `InteractiveCropScreen.kt`
+
+`Canvas(...).pointerInput(displayedImageBounds, cropGeometry) { detectDragGestures(...) }`
+memakai `cropGeometry` sebagai salah satu **key** pointerInput. Tapi `cropGeometry` diubah
+**di dalam `onDrag` itu sendiri** setiap piksel jari bergerak. Compose pointerInput
+me-restart ulang seluruh coroutine gesture-nya setiap kali salah satu key berubah — jadi
+setiap gerakan sekecil apa pun membatalkan `detectDragGestures` yang sedang berjalan dan
+memulainya dari nol lagi, sebelum drag sempat "menempel" secara berkelanjutan. Efek yang
+terlihat pengguna: jari terasa menyentuh handle, tapi bingkai tidak pernah benar-benar
+bergeser mengikuti jari.
+
+**Fix:** `cropGeometry` dihapus dari daftar key. Lambda `onDrag`/`onDragStart` tetap
+membaca nilai `cropGeometry` terbaru lewat closure state Compose biasa — tidak perlu
+me-restart coroutine untuk itu. Hanya `displayedImageBounds` yang valid sebagai key
+(berubah jarang: saat layout awal atau setelah rotasi).
+
+### 2. Bug filter — root cause ditemukan di `FilterProcessor.kt`
+
+Filter `Mempertajam` (`applySuperSharpen`), `Magic Color` (`applyMagicColor`), dan
+`Otomatis` (yang bisa memanggil salah satu dari keduanya) punya cabang khusus untuk
+**mempertahankan** warna asli elemen seperti stempel biru/tanda tangan/materai merah —
+piksel dengan `chroma >= 20` (atau `22`) DINAIKKAN saturasinya 1.4x alih-alih diratakan
+ke putih seperti bayangan biasa.
+
+Masalahnya: bayangan hangat/kuning khas foto kamera HP indoor (bukan tinta berwarna sama
+sekali) juga sering punya chroma di atas 20 — karena channel R dan G tinggi sementara B
+jauh lebih rendah. Bayangan seperti itu, alih-alih diratakan ke putih, malah ikut kena
+saturasi 1.4x dan berubah jadi **noda kuning pekat** — persis pola yang terlihat di
+screenshot 2 pengguna (blotch kuning besar menutupi sebagian dokumen).
+
+**Fix:** ditambahkan `isWarmShadowCast(r, g, b)` — mendeteksi pola spesifik "R dan G
+sama-sama jauh di atas B" (ciri bayangan kuning/oranye) dan MENGECUALIKANNYA dari cabang
+"elemen warna" di kedua filter. Stempel merah sungguhan tidak ikut terkecualikan karena G
+pada tinta merah tetap rendah (hanya R yang tinggi) — jadi diskriminatornya tetap akurat
+membedakan bayangan hangat vs tinta berwarna asli. Jalur deteksi tinta biru
+(`b > r + ... && b > g + ...`) sama sekali tidak tersentuh perubahan ini.
+
+**Belum diverifikasi di device fisik** — perbaikan ini berbasis analisis kode + pola warna
+di screenshot, bukan hasil re-run scan langsung (lingkungan pengembangan tidak punya
+Android SDK/device/emulator). Rekomendasi: uji ulang scan dokumen yang sama persis dengan
+kondisi pencahayaan di screenshot 2 untuk konfirmasi visual sebelum rilis.
+
+
 ## Investigasi CI 2026-08-23 — Kegagalan `:app:testDebugUnitTest`
 
 **Input:** log build GitHub Actions (`logs_88446603491.zip`) + laporan HTML/XML unit
