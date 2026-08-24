@@ -305,7 +305,18 @@ fun InteractiveCropScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(16.dp)
-                    .pointerInput(displayedImageBounds, cropGeometry) {
+                    // [Audit] BUG UTAMA "crop tidak bisa digeser": `cropGeometry` sebelumnya
+                    // ikut jadi key pointerInput di sini. cropGeometry berubah SETIAP frame
+                    // saat jari digeser (diset di dalam onDrag() di bawah) -- itu artinya
+                    // pointerInput mendeteksi key berubah lalu MEMBATALKAN & ME-RESTART ULANG
+                    // seluruh detectDragGestures() pada setiap gerakan sekecil apa pun, sebelum
+                    // sempat mendaftarkan gerakan itu sebagai drag yang berkelanjutan. Hasilnya:
+                    // jari terasa "menempel" tapi bingkai tidak pernah benar-benar bergeser.
+                    // cropGeometry TIDAK PERLU jadi key -- lambda onDrag membaca State terbaru
+                    // lewat closure setiap kali dipanggil (state Compose selalu terbaca "live",
+                    // tidak perlu re-launch coroutine untuk itu). Hanya displayedImageBounds yang
+                    // valid sebagai key (berubah jarang -- saat layout/rotasi, bukan saat drag).
+                    .pointerInput(displayedImageBounds) {
                         detectDragGestures(
                             onDragStart = { touchOffset ->
                                 if (displayedImageBounds.isEmpty) return@detectDragGestures
