@@ -3,6 +3,7 @@ package com.example.core.filter
 import android.graphics.*
 import androidx.compose.ui.geometry.Offset
 import com.example.core.crop.AutoCropDetector
+import com.example.core.crop.DocumentDewarpProcessor
 import com.example.core.model.CropGeometry
 import com.example.core.model.FilterSettings
 import com.example.core.model.FilterType
@@ -17,6 +18,21 @@ import kotlin.math.roundToInt
  * high-pass text sharpening, and color stamp/signature preservation (matching CamScanner Ajaib Pro).
  */
 object FilterProcessor {
+
+    private data class ScanProfile(
+        val meanLuma: Double,
+        val standardDeviation: Double,
+        val averageChroma: Double,
+        val neutralFraction: Double,
+        val paperFraction: Double,
+        val inkFraction: Double
+    ) {
+        val looksLikeDocument: Boolean
+            get() = neutralFraction >= 0.52 &&
+                paperFraction >= 0.24 &&
+                inkFraction >= 0.006 &&
+                standardDeviation >= 10.0
+    }
 
     fun applyFilter(
         source: Bitmap,
@@ -67,6 +83,9 @@ object FilterProcessor {
         var lumaSum = 0.0
         var lumaSquareSum = 0.0
         var chromaSum = 0.0
+        var neutralSamples = 0
+        var paperSamples = 0
+        var inkSamples = 0
         var samples = 0
         // One bulk row read per sampled y (native call), then sample every sampleStep-th column
         // out of that row in plain CPU-side array indexing -- keeps the exact same sparse grid
@@ -82,7 +101,11 @@ object FilterProcessor {
                 val luma = (299 * red + 587 * green + 114 * blue) / 1000.0
                 lumaSum += luma
                 lumaSquareSum += luma * luma
-                chromaSum += max(red, max(green, blue)) - min(red, min(green, blue))
+                val chroma = max(red, max(green, blue)) - min(red, min(green, blue))
+                chromaSum += chroma
+                if (chroma <= 34) neutralSamples++
+                if (luma >= 168.0 && chroma <= 42) paperSamples++
+                if (luma <= 128.0) inkSamples++
                 samples++
             }
         }
@@ -91,10 +114,24 @@ object FilterProcessor {
         val mean = lumaSum / samples
         val standardDeviation = kotlin.math.sqrt((lumaSquareSum / samples - mean * mean).coerceAtLeast(0.0))
         val averageChroma = chromaSum / samples
+        val profile = ScanProfile(
+            meanLuma = mean,
+            standardDeviation = standardDeviation,
+            averageChroma = averageChroma,
+            neutralFraction = neutralSamples.toDouble() / samples,
+            paperFraction = paperSamples.toDouble() / samples,
+            inkFraction = inkSamples.toDouble() / samples
+        )
         return when {
-            averageChroma >= 16.0 -> applyMagicColor(source, 1f, 1f)
-            standardDeviation < 38.0 || mean < 145.0 -> applyNoShadow(source, 1.05f, 1.08f)
-            else -> applySuperSharpen(source, 1f, 0.92f)
+            // AUTO is used by the scanner's document modes. A neutral page with both paper and
+            // ink evidence must receive the complete local-normalization pipeline; the old global
+            // standard-deviation rule frequently routed shadowed forms to NO_SHADOW, producing a
+            // brighter but still gray and soft photograph.
+            profile.looksLikeDocument -> applyMagicColor(source, 1.04f, 1.12f)
+            profile.averageChroma >= 26.0 -> applyPhotoEnhance(source)
+            profile.standardDeviation < 38.0 || profile.meanLuma < 145.0 ->
+                applyNoShadow(source, 1.05f, 1.10f)
+            else -> applySuperSharpen(source, 1f, 1.02f)
         }
     }
 
@@ -190,8 +227,12 @@ object FilterProcessor {
             }
         }
 
-        // Apply high-pass sharpening on text pixels to enhance small character legibility
-        applyUnsharpSharpen(outPixels, width, height, strength = 0.5f)
+        // Multi-scale, restrained sharpening: the 1px pass restores fine glyph edges while the
+        // wider pass restores stroke contrast lost to camera demosaicing and perspective
+        // resampling. Pure paper pixels are skipped inside applyUnsharpSharpen, preventing noise
+        // and halos from being manufactured in the white background.
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.62f, radius = 1)
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.34f, radius = 2)
 
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         output.setPixels(outPixels, 0, width, 0, 0, width, height)
@@ -320,6 +361,11 @@ object FilterProcessor {
                 outPixels[rowOffset + x] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
             }
         }
+
+        // NO_SHADOW used to stop after illumination scaling, so the default AUTO path often
+        // looked like a merely brightened photograph. A light edge pass restores legibility
+        // without turning this natural-tone preset into hard black-and-white.
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.24f, radius = 2)
 
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         output.setPixels(outPixels, 0, width, 0, 0, width, height)
@@ -557,6 +603,7 @@ object FilterProcessor {
         val rawGrid = Array(rows) { FloatArray(cols) }
         val blockW = width / cols
         val blockH = height / rows
+        val luminanceHistogram = IntArray(64)
 
         for (r in 0 until rows) {
             val startY = r * blockH
@@ -566,11 +613,12 @@ object FilterProcessor {
                 val startX = c * blockW
                 val endX = if (c == cols - 1) width else (c + 1) * blockW
 
-                // Sample top 15% brightest pixels in this block to find paper background level
-                var maxLum1 = 0
-                var maxLum2 = 0
-                var maxLum3 = 0
-                var maxLum4 = 0
+                // Estimate paper from a robust upper luminance percentile. The previous "four
+                // brightest pixels" estimator was easily dominated by glare or a few clipped
+                // highlights, which made adjacent grid cells disagree and left visible patches
+                // after normalization.
+                luminanceHistogram.fill(0)
+                var sampleCount = 0
 
                 val stepY = max(1, (endY - startY) / 8)
                 val stepX = max(1, (endX - startX) / 8)
@@ -583,27 +631,24 @@ object FilterProcessor {
                         val pg = (p shr 8) and 0xFF
                         val pb = p and 0xFF
                         val lum = (299 * pr + 587 * pg + 114 * pb + 500) / 1000
-
-                        if (lum > maxLum1) {
-                            maxLum4 = maxLum3
-                            maxLum3 = maxLum2
-                            maxLum2 = maxLum1
-                            maxLum1 = lum
-                        } else if (lum > maxLum2) {
-                            maxLum4 = maxLum3
-                            maxLum3 = maxLum2
-                            maxLum2 = lum
-                        } else if (lum > maxLum3) {
-                            maxLum4 = maxLum3
-                            maxLum3 = lum
-                        } else if (lum > maxLum4) {
-                            maxLum4 = lum
-                        }
+                        luminanceHistogram[(lum * (luminanceHistogram.size - 1) / 255)
+                            .coerceIn(0, luminanceHistogram.lastIndex)]++
+                        sampleCount++
                     }
                 }
 
-                val avgPaperLum = if (maxLum1 > 0) {
-                    ((maxLum1 + maxLum2 + maxLum3 + maxLum4) / 4f).coerceIn(40f, 255f)
+                val target = (sampleCount * 0.82f).roundToInt().coerceAtLeast(1)
+                var accumulated = 0
+                var percentileBucket = luminanceHistogram.lastIndex
+                for (bucket in luminanceHistogram.indices) {
+                    accumulated += luminanceHistogram[bucket]
+                    if (accumulated >= target) {
+                        percentileBucket = bucket
+                        break
+                    }
+                }
+                val avgPaperLum = if (sampleCount > 0) {
+                    (percentileBucket * 255f / luminanceHistogram.lastIndex).coerceIn(40f, 255f)
                 } else 200f
 
                 rawGrid[r][c] = avgPaperLum
@@ -781,7 +826,13 @@ object FilterProcessor {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
         canvas.drawBitmap(source, matrix, paint)
 
-        return result
+        // A projective transform only makes the four selected corners rectangular. It cannot
+        // remove the curved rows produced by a physically bowed sheet. Run a confidence-gated
+        // mesh dewarp after the homography; documents without enough reliable horizontal
+        // structures are returned untouched, so photo/ID-card scans are not blindly warped.
+        val dewarped = DocumentDewarpProcessor.flatten(result)
+        if (dewarped.bitmap !== result && !result.isRecycled) result.recycle()
+        return dewarped.bitmap
     }
 
     /**

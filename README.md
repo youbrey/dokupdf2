@@ -43,7 +43,13 @@ Compose UI ──> DocumentController ──> DocumentEngine / CommandManager
                                      v       v
                               RenderEngine  PdfGenerator
 
-CameraX / Galeri / PDF ──> AutoCropDetector ──> FilterProcessor
+CameraX / Galeri / PDF ──> AutoCropDetector ──> Perspective Warp
+                                                    │
+                                                    v
+                                      DocumentDewarpProcessor
+                                                    │
+                                                    v
+                                           FilterProcessor
                                                     │
                                                     v
                                            PdfConverterEngine
