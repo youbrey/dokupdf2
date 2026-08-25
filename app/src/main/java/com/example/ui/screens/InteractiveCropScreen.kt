@@ -37,7 +37,6 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.crop.AutoCropDetector
-import com.example.core.filter.FilterProcessor
 import com.example.core.model.CropGeometry
 import com.example.ui.theme.*
 import kotlinx.coroutines.Dispatchers
@@ -78,7 +77,7 @@ fun InteractiveCropScreen(
     initialBitmap: Bitmap,
     initialGeometry: CropGeometry? = null,
     onBack: () -> Unit,
-    onCropConfirmed: (croppedBitmap: Bitmap, geometry: CropGeometry, rotatedBitmap: Bitmap) -> Unit
+    onCropConfirmed: (geometry: CropGeometry, rotatedBitmap: Bitmap) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -241,36 +240,13 @@ fun InteractiveCropScreen(
                     // Confirm & Next
                     Button(
                         onClick = {
-                            scope.launch {
-                                isProcessing = true
-                                try {
-                                    val cropped = withContext(Dispatchers.Default) {
-                                        FilterProcessor.cropPerspective(workingBitmap, cropGeometry)
-                                    }
-                                    isProcessing = false
-                                    // Ownership of workingBitmap passes to the caller from this point on
-                                    // (it becomes the page's new originalBitmap) -- the dispose cleanup
-                                    // above must not recycle it out from under that new owner.
-                                    workingBitmapOwnershipTransferred = true
-                                    onCropConfirmed(cropped, cropGeometry, workingBitmap)
-                                } catch (oom: OutOfMemoryError) {
-                                    Log.e("DokuPdfCrop", "Memori tidak cukup untuk crop perspektif", oom)
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Memori tidak cukup untuk memotong gambar ini.",
-                                        android.widget.Toast.LENGTH_LONG
-                                    ).show()
-                                } catch (error: Exception) {
-                                    Log.e("DokuPdfCrop", "Crop perspektif gagal", error)
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Gagal memotong gambar: ${error.message ?: "geometri tidak valid"}",
-                                        android.widget.Toast.LENGTH_LONG
-                                    ).show()
-                                } finally {
-                                    isProcessing = false
-                                }
-                            }
+                            // Persist only the normalized geometry. The review/export pipeline
+                            // already renders crop + mesh dewarp lazily at its required resolution.
+                            // The old path rendered a full-resolution crop here and immediately
+                            // recycled it in ScannerScreen, doubling latency and peak memory for no
+                            // visible benefit.
+                            workingBitmapOwnershipTransferred = true
+                            onCropConfirmed(cropGeometry, workingBitmap)
                         },
                         enabled = !isProcessing && isEditableGeometryValid(cropGeometry),
                         colors = ButtonDefaults.buttonColors(containerColor = SleekBluePrimary),

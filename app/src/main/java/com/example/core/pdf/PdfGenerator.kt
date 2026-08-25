@@ -77,12 +77,10 @@ class PdfGenerator(
                             ownsWorkingBitmap = rotated !== rawBitmap
                         }
 
-                        // [Audit — perbaikan ketajaman/DPI] Lihat catatan lengkap di
-                        // PdfConverterEngine.prepareOptimizedBitmapForPdf: 1600px sisi
-                        // terpanjang (~137 DPI di A4) adalah bottleneck utama di balik hasil
-                        // yang terlihat blur/lembek dibanding CamScanner. Basis dinaikkan ke
-                        // 2480px (~212 DPI) sebelum dikalikan faktor `quality` pemanggil.
-                        val maximumDimension = 2480f * quality
+                        // Keep the editor export path aligned with scanner export quality.
+                        // 3008px is approximately 257 DPI on A4 and avoids the visibly soft
+                        // 137-212 DPI ceiling used by older builds.
+                        val maximumDimension = 3008f * quality
                         val longest = maxOf(workingBitmap.width, workingBitmap.height).toFloat()
                         if (longest > maximumDimension) {
                             val scale = maximumDimension / longest

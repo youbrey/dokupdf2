@@ -242,6 +242,8 @@ enum class ScanMode(val title: String) {
 }
 
 private const val MAX_SCANNER_SESSION_PAGES = 100
+private const val STANDARD_SCAN_LONG_EDGE = 2200
+private const val HD_SCAN_LONG_EDGE = 3008
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -631,7 +633,7 @@ fun ScannerScreen(
             initialBitmap = targetPage.originalBitmap,
             initialGeometry = targetPage.cropGeometry,
             onBack = { cropTargetPageIndex = null },
-            onCropConfirmed = { croppedBmp, geometry, rotatedBmp ->
+            onCropConfirmed = { geometry, rotatedBmp ->
                 val idx = activeCropPageIndex
                 if (idx in scannedPages.indices) {
                     val previous = scannedPages[idx]
@@ -641,7 +643,6 @@ fun ScannerScreen(
                         // Render the crop lazily to avoid retaining two full-resolution bitmaps/page.
                         croppedBitmap = null
                     )
-                    if (croppedBmp !== rotatedBmp && !croppedBmp.isRecycled) croppedBmp.recycle()
                     // BUG FIX (leaked full-resolution bitmap per re-crop -> cumulative OOM crash on
                     // a later capture): the page's old originalBitmap/croppedBitmap are fully
                     // replaced above but were never recycled, so every "Potong Ulang" confirm held
@@ -651,7 +652,6 @@ fun ScannerScreen(
                     // never a bitmap another page might still share a reference to.
                     val orphanedOriginal = previous.originalBitmap
                     if (orphanedOriginal !== rotatedBmp &&
-                        orphanedOriginal !== croppedBmp &&
                         !orphanedOriginal.isRecycled &&
                         scannedPages.none { it.originalBitmap === orphanedOriginal }
                     ) {
@@ -660,7 +660,6 @@ fun ScannerScreen(
                     val orphanedCropped = previous.croppedBitmap
                     if (orphanedCropped != null &&
                         orphanedCropped !== rotatedBmp &&
-                        orphanedCropped !== croppedBmp &&
                         !orphanedCropped.isRecycled &&
                         scannedPages.none { it.croppedBitmap === orphanedCropped }
                     ) {
@@ -1107,7 +1106,11 @@ fun ScannerScreen(
                                             val bmp = try {
                                                 imageProxyToBitmap(
                                                     imageProxy,
-                                                    maxDimension = if (isHdQuality) 2600 else 1600
+                                                    maxDimension = if (isHdQuality) {
+                                                        HD_SCAN_LONG_EDGE
+                                                    } else {
+                                                        STANDARD_SCAN_LONG_EDGE
+                                                    }
                                                 )
                                             } finally {
                                                 imageProxy.close()
@@ -2088,7 +2091,7 @@ private fun createAutoCroppedPage(bitmap: Bitmap, mode: ScanMode): ScannedPageIt
     )
 }
 
-private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = 2600): Bitmap? {
+private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = HD_SCAN_LONG_EDGE): Bitmap? {
     var decodedBitmap: Bitmap? = null
     return try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -2171,11 +2174,11 @@ private fun decodeUriBitmap(context: Context, uri: Uri, maxDimension: Int = 2600
  * intermittent rather than 100% reproducible.
  *
  * Fix: read the JPEG's dimensions first (cheap, no pixel allocation), compute an inSampleSize
- * that caps the long edge at [maxDimension] px (2600px is already well beyond what's needed for
- * a sharp document scan / OCR pass), decode at that size, and catch OutOfMemoryError explicitly
+ * that caps the long edge at [maxDimension] px (3008px in HD mode, matching the tested export
+ * class while the fast mode remains smaller), decode at that size, and catch OutOfMemoryError explicitly
  * so a failed capture degrades to "gagal, coba lagi" instead of killing the app.
  */
-private fun imageProxyToBitmap(imageProxy: ImageProxy, maxDimension: Int = 2600): Bitmap? {
+private fun imageProxyToBitmap(imageProxy: ImageProxy, maxDimension: Int = HD_SCAN_LONG_EDGE): Bitmap? {
     return try {
         val plane = imageProxy.planes[0]
         val buffer = plane.buffer

@@ -40,6 +40,15 @@ object AutoCropDetector {
         val coverage: Float
     )
 
+    private data class GeometryCandidate(
+        val geometry: CropGeometry,
+        val left: LineModel,
+        val right: LineModel,
+        val top: LineModel,
+        val bottom: LineModel,
+        val jointScore: Float
+    )
+
     fun detectDocumentCorners(bitmap: Bitmap): CropGeometry = detect(bitmap).geometry
 
     fun detect(bitmap: Bitmap): AutoCropResult {
@@ -72,41 +81,51 @@ object AutoCropDetector {
             computeSobel(luma, analysisWidth, analysisHeight, gradientX, gradientY, magnitudes)
             val edgeThreshold = percentileThreshold(magnitudes, 0.78f).coerceAtLeast(14f)
 
-            val left = findVerticalBoundary(
+            val leftCandidates = findVerticalBoundaries(
                 luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
                 preferOuter = true, threshold = edgeThreshold
             )
-            val right = findVerticalBoundary(
+            val rightCandidates = findVerticalBoundaries(
                 luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
                 preferOuter = false, threshold = edgeThreshold
             )
-            val top = findHorizontalBoundary(
+            val topCandidates = findHorizontalBoundaries(
                 luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
                 preferOuter = true, threshold = edgeThreshold
             )
-            val bottom = findHorizontalBoundary(
+            val bottomCandidates = findHorizontalBoundaries(
                 luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
                 preferOuter = false, threshold = edgeThreshold
             )
 
-            val leftLine = left ?: return fallbackResult("left_boundary_not_found")
-            val rightLine = right ?: return fallbackResult("right_boundary_not_found")
-            val topLine = top ?: return fallbackResult("top_boundary_not_found")
-            val bottomLine = bottom ?: return fallbackResult("bottom_boundary_not_found")
+            if (leftCandidates.isEmpty()) return fallbackResult("left_boundary_not_found")
+            if (rightCandidates.isEmpty()) return fallbackResult("right_boundary_not_found")
+            if (topCandidates.isEmpty()) return fallbackResult("top_boundary_not_found")
+            if (bottomCandidates.isEmpty()) return fallbackResult("bottom_boundary_not_found")
 
-            val tl = intersect(leftLine, topLine, analysisWidth, analysisHeight)
-            val tr = intersect(rightLine, topLine, analysisWidth, analysisHeight)
-            val br = intersect(rightLine, bottomLine, analysisWidth, analysisHeight)
-            val bl = intersect(leftLine, bottomLine, analysisWidth, analysisHeight)
-            val geometry = CropGeometry(tl, tr, br, bl)
+            // Do not choose each side independently. Long table/form lines often have a higher
+            // raw gradient score than the paper boundary; four independent winners can therefore
+            // describe four unrelated internal lines. Evaluate spatially distinct alternatives as
+            // complete quadrilaterals and reward page coverage, edge support and opposite-side
+            // consistency together.
+            val selected = selectBestGeometry(
+                leftCandidates,
+                rightCandidates,
+                topCandidates,
+                bottomCandidates,
+                analysisWidth,
+                analysisHeight
+            ) ?: return fallbackResult("no_consistent_document_quadrilateral")
+
+            val geometry = selected.geometry
 
             val minimumCoverage = min(
-                min(leftLine.coverage, rightLine.coverage),
-                min(topLine.coverage, bottomLine.coverage)
+                min(selected.left.coverage, selected.right.coverage),
+                min(selected.top.coverage, selected.bottom.coverage)
             )
             if (minimumCoverage < 0.055f) {
                 fallbackResult("insufficient_edge_coverage")
@@ -114,7 +133,11 @@ object AutoCropDetector {
                 fallbackResult("invalid_detected_geometry")
             } else {
                 val area = polygonArea(geometry)
-                val confidence = (minimumCoverage * 1.8f + area * 0.45f).coerceIn(0f, 1f)
+                val confidence = (
+                    minimumCoverage * 1.45f +
+                        area * 0.34f +
+                        selected.jointScore * 0.22f
+                    ).coerceIn(0f, 1f)
                 AutoCropResult(geometry, confidence, usedFallback = false)
             }
         } catch (_: OutOfMemoryError) {
@@ -195,7 +218,7 @@ object AutoCropDetector {
         return histogram.lastIndex * 3f
     }
 
-    private fun findVerticalBoundary(
+    private fun findVerticalBoundaries(
         luma: FloatArray,
         gradientX: FloatArray,
         gradientY: FloatArray,
@@ -205,7 +228,7 @@ object AutoCropDetector {
         maxBaseFraction: Float,
         preferOuter: Boolean,
         threshold: Float
-    ): LineModel? {
+    ): List<LineModel> {
         val minBase = (width * minBaseFraction).roundToInt()
         val maxBase = (width * maxBaseFraction).roundToInt()
         val middleY = (height - 1) / 2f
@@ -213,7 +236,11 @@ object AutoCropDetector {
         // di findHorizontalBoundary (logika identik, hanya sumbunya ditukar).
         val sideOffset = (width * 0.045f).roundToInt().coerceIn(3, 24)
         val innerSign = if (preferOuter) 1 else -1
-        var best: LineModel? = null
+        // The global percentile is often set by black table rules on white paper. A legitimate
+        // paper/background edge has lower contrast, so use a slightly softer bar for continuity
+        // while retaining the full threshold for response-score normalization.
+        val coverageThreshold = max(14f, threshold * 0.72f)
+        val candidates = ArrayList<LineModel>()
 
         var slope = -0.70f
         while (slope <= 0.7001f) {
@@ -228,10 +255,19 @@ object AutoCropDetector {
                 for (y in 2 until height - 2 step 2) {
                     val x = (base + slope * (y - middleY)).roundToInt()
                     if (x !in 2 until width - 2) continue
-                    val index = y * width + x
-                    val response = abs(gradientX[index] - slope * gradientY[index]) / normalLength
+                    var response = 0f
+                    // Search a narrow band normal to the proposed line. Quantized slope/base
+                    // values otherwise miss a genuine one-pixel page boundary while perfectly
+                    // aligned table rules keep full coverage.
+                    for (offset in -2..2) {
+                        val index = y * width + x + offset
+                        response = max(
+                            response,
+                            abs(gradientX[index] - slope * gradientY[index]) / normalLength
+                        )
+                    }
                     sum += min(response, threshold * 4f)
-                    if (response >= threshold) strong++
+                    if (response >= coverageThreshold) strong++
                     valid++
 
                     val innerX = x + innerSign * sideOffset
@@ -248,14 +284,18 @@ object AutoCropDetector {
                 val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
                 val brightnessFactor = brightnessBiasFactor(innerLumaSum, outerLumaSum, sideSamples)
                 val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior * brightnessFactor
-                if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
+                if (score.isFinite()) candidates += LineModel(slope, base.toFloat(), score, coverage)
             }
             slope += 0.05f
         }
-        return best
+        return selectDistinctLineModels(
+            candidates = candidates,
+            maximumCount = 8,
+            minimumInterceptGap = (width * 0.035f).coerceAtLeast(4f)
+        )
     }
 
-    private fun findHorizontalBoundary(
+    private fun findHorizontalBoundaries(
         luma: FloatArray,
         gradientX: FloatArray,
         gradientY: FloatArray,
@@ -265,13 +305,14 @@ object AutoCropDetector {
         maxBaseFraction: Float,
         preferOuter: Boolean,
         threshold: Float
-    ): LineModel? {
+    ): List<LineModel> {
         val minBase = (height * minBaseFraction).roundToInt()
         val maxBase = (height * maxBaseFraction).roundToInt()
         val middleX = (width - 1) / 2f
         val sideOffset = (height * 0.045f).roundToInt().coerceIn(3, 24)
         val innerSign = if (preferOuter) 1 else -1
-        var best: LineModel? = null
+        val coverageThreshold = max(14f, threshold * 0.72f)
+        val candidates = ArrayList<LineModel>()
 
         var slope = -0.70f
         while (slope <= 0.7001f) {
@@ -286,10 +327,16 @@ object AutoCropDetector {
                 for (x in 2 until width - 2 step 2) {
                     val y = (base + slope * (x - middleX)).roundToInt()
                     if (y !in 2 until height - 2) continue
-                    val index = y * width + x
-                    val response = abs(gradientY[index] - slope * gradientX[index]) / normalLength
+                    var response = 0f
+                    for (offset in -2..2) {
+                        val index = (y + offset) * width + x
+                        response = max(
+                            response,
+                            abs(gradientY[index] - slope * gradientX[index]) / normalLength
+                        )
+                    }
                     sum += min(response, threshold * 4f)
-                    if (response >= threshold) strong++
+                    if (response >= coverageThreshold) strong++
                     valid++
 
                     val innerY = y + innerSign * sideOffset
@@ -306,11 +353,125 @@ object AutoCropDetector {
                 val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
                 val brightnessFactor = brightnessBiasFactor(innerLumaSum, outerLumaSum, sideSamples)
                 val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior * brightnessFactor
-                if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
+                if (score.isFinite()) candidates += LineModel(slope, base.toFloat(), score, coverage)
             }
             slope += 0.05f
         }
-        return best
+        return selectDistinctLineModels(
+            candidates = candidates,
+            maximumCount = 8,
+            minimumInterceptGap = (height * 0.035f).coerceAtLeast(4f)
+        )
+    }
+
+    private fun selectDistinctLineModels(
+        candidates: List<LineModel>,
+        maximumCount: Int,
+        minimumInterceptGap: Float
+    ): List<LineModel> {
+        if (candidates.isEmpty()) return emptyList()
+        val selected = ArrayList<LineModel>(maximumCount)
+        for (candidate in candidates.sortedByDescending { it.score }) {
+            if (selected.none { abs(it.intercept - candidate.intercept) < minimumInterceptGap }) {
+                selected += candidate
+                if (selected.size == maximumCount) break
+            }
+        }
+        return selected
+    }
+
+    private fun selectBestGeometry(
+        leftCandidates: List<LineModel>,
+        rightCandidates: List<LineModel>,
+        topCandidates: List<LineModel>,
+        bottomCandidates: List<LineModel>,
+        width: Int,
+        height: Int
+    ): GeometryCandidate? {
+        val maximumLeftScore = leftCandidates.maxOfOrNull { it.score }?.coerceAtLeast(0.001f) ?: return null
+        val maximumRightScore = rightCandidates.maxOfOrNull { it.score }?.coerceAtLeast(0.001f) ?: return null
+        val maximumTopScore = topCandidates.maxOfOrNull { it.score }?.coerceAtLeast(0.001f) ?: return null
+        val maximumBottomScore = bottomCandidates.maxOfOrNull { it.score }?.coerceAtLeast(0.001f) ?: return null
+
+        var best: GeometryCandidate? = null
+        var bestSupported: GeometryCandidate? = null
+        for (left in leftCandidates) {
+            for (right in rightCandidates) {
+                for (top in topCandidates) {
+                    for (bottom in bottomCandidates) {
+                        val geometry = CropGeometry(
+                            topLeft = intersect(left, top, width, height),
+                            topRight = intersect(right, top, width, height),
+                            bottomRight = intersect(right, bottom, width, height),
+                            bottomLeft = intersect(left, bottom, width, height)
+                        )
+                        if (!isValidGeometry(geometry)) continue
+
+                        val area = polygonArea(geometry)
+                        val topWidth = distance(geometry.topLeft, geometry.topRight)
+                        val bottomWidth = distance(geometry.bottomLeft, geometry.bottomRight)
+                        val leftHeight = distance(geometry.topLeft, geometry.bottomLeft)
+                        val rightHeight = distance(geometry.topRight, geometry.bottomRight)
+                        val firstDiagonal = distance(geometry.topLeft, geometry.bottomRight)
+                        val secondDiagonal = distance(geometry.topRight, geometry.bottomLeft)
+
+                        val oppositeSideBalance = (
+                            min(topWidth, bottomWidth) / max(topWidth, bottomWidth).coerceAtLeast(0.001f) +
+                                min(leftHeight, rightHeight) / max(leftHeight, rightHeight).coerceAtLeast(0.001f)
+                            ) * 0.5f
+                        val diagonalBalance = min(firstDiagonal, secondDiagonal) /
+                            max(firstDiagonal, secondDiagonal).coerceAtLeast(0.001f)
+                        val shapeScore = (oppositeSideBalance * 0.72f + diagonalBalance * 0.28f).coerceIn(0f, 1f)
+
+                        val edgeScore = (
+                            left.score / maximumLeftScore +
+                                right.score / maximumRightScore +
+                                top.score / maximumTopScore +
+                                bottom.score / maximumBottomScore
+                            ) * 0.25f
+                        val averageCoverage = (
+                            left.coverage + right.coverage + top.coverage + bottom.coverage
+                            ) * 0.25f
+                        val minimumCoverage = min(
+                            min(left.coverage, right.coverage),
+                            min(top.coverage, bottom.coverage)
+                        )
+                        val coverageScore = (averageCoverage / 0.32f).coerceIn(0f, 1f)
+
+                        // Page area receives the largest weight on purpose. Internal table lines can
+                        // be exceptionally strong, but a crop built from them discards a large part
+                        // of the sheet. A real smaller document still wins because no supported
+                        // outer candidates exist around it; this term only compares detected lines.
+                        val jointScore = (
+                            area * 0.56f +
+                                edgeScore * 0.23f +
+                                coverageScore * 0.13f +
+                                shapeScore * 0.08f
+                            ).coerceIn(0f, 1f)
+                        val candidate = GeometryCandidate(
+                            geometry = geometry,
+                            left = left,
+                            right = right,
+                            top = top,
+                            bottom = bottom,
+                            jointScore = jointScore
+                        )
+                        if (best == null || jointScore > best.jointScore) best = candidate
+
+                        // Area is intentionally the dominant term, but it must never promote a
+                        // largely imaginary outer line over a quadrilateral whose four sides are
+                        // actually observed. Keep the best unconstrained candidate only so flat
+                        // images still produce the precise `insufficient_edge_coverage` reason.
+                        if (minimumCoverage >= 0.055f &&
+                            (bestSupported == null || jointScore > bestSupported.jointScore)
+                        ) {
+                            bestSupported = candidate
+                        }
+                    }
+                }
+            }
+        }
+        return bestSupported ?: best
     }
 
     /**
@@ -330,16 +491,19 @@ object AutoCropDetector {
      * sisinya sama-sama kertas putih (kecerahan hampir sama, selisih mendekati nol).
      *
      * Fungsi ini memberi bobot skor berdasarkan pola itu: dukungan penuh (x1.0) kalau sisi
-     * dalam jelas lebih terang dari sisi luar, diturunkan bertahap sampai minimum x0.35 kalau
+     * dalam jelas lebih terang dari sisi luar, diturunkan bertahap sampai minimum x0.18 kalau
      * polanya terbalik/tidak ada — sengaja tidak menolak total (bukan hard filter) supaya
      * dokumen dengan latar belakang terang (mis. discan di atas meja putih) masih bisa
      * terdeteksi lewat sinyal gradien seperti sebelumnya, hanya kalah prioritas dibanding
      * kandidat lain yang polanya lebih meyakinkan.
      */
     private fun brightnessBiasFactor(innerLumaSum: Float, outerLumaSum: Float, sideSamples: Int): Float {
-        if (sideSamples == 0) return 0.5f
+        if (sideSamples == 0) return 0.42f
         val diff = (innerLumaSum - outerLumaSum) / sideSamples
-        return ((diff.coerceIn(-40f, 60f) + 40f) / 100f) * 0.65f + 0.35f
+        // A zero difference is characteristic of a table rule with white paper on both sides.
+        // Keep a non-zero floor for documents photographed on a light desk, but make that neutral
+        // candidate substantially weaker than a real bright-paper/darker-background transition.
+        return ((diff.coerceIn(-20f, 45f) + 20f) / 65f) * 0.82f + 0.18f
     }
 
 
