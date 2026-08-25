@@ -1,5 +1,53 @@
 # DokuPDF - Project Changelog
 
+## [Unreleased] - 2026-08-25 (lanjutan)
+### Fitur Baru: "Simpan ke Perangkat" (setara "Simpan ke Galeri" CamScanner)
+**Root cause keluhan "tidak bisa menyimpan/ekspor":** seluruh proyek sebelumnya tidak
+pernah memakai `MediaStore` atau `DownloadManager` (dikonfirmasi lewat grep menyeluruh).
+PDF hasil scan/PDF Tools hanya tersimpan di sandbox privat aplikasi
+(`context.filesDir`/`context.cacheDir`) yang tidak bisa diakses aplikasi File Manager/Galeri
+lain — satu-satunya jalan keluar adalah `Intent.ACTION_SEND` (share sheet), bukan aksi
+"simpan ke perangkat" mandiri.
+
+**Ditambahkan:**
+- `core/pdf/ExportUtils.kt` (baru) — menyalin berkas dari sandbox privat ke `Download/DokuPDF/`
+  publik. Dua jalur sesuai versi Android: `MediaStore.Downloads` untuk API 29+ (tanpa izin,
+  scoped storage), dan `Environment.DIRECTORY_DOWNLOADS` + izin runtime
+  `WRITE_EXTERNAL_STORAGE` untuk API 24-28 (sesuai minSdk=24 proyek ini). Penamaan berkas
+  otomatis dibuat unik (query MediaStore/filesystem sungguhan, bukan asumsi) supaya ekspor
+  berulang tidak saling menimpa.
+- `AndroidManifest.xml` — izin `WRITE_EXTERNAL_STORAGE` dengan `maxSdkVersion="28"`.
+- `ScannerScreen.kt` — dialog "PDF Berhasil Dibuat" sekarang punya tombol "Simpan ke
+  Perangkat" di samping "Bagikan", lengkap alur permintaan izin runtime untuk API 24-28.
+- `PdfToolsScreen.kt` — tombol "Simpan ke Perangkat" ditambahkan di samping "Bagikan Hasil"
+  untuk seluruh hasil PDF Tools (kompres, gabung, konversi, dll), mendukung multi-file
+  sekaligus. Pesan hasil melaporkan jujur jika sebagian berkas gagal disimpan (bukan pesan
+  sukses generik ketika sebagian sebenarnya gagal).
+
+**[Refactor]** Fungsi `mimeTypeFor()` yang sebelumnya `private` di `PdfToolsScreen.kt`
+dipindahkan ke `ExportUtils.kt` sebagai satu sumber kebenaran, dipakai bersama oleh
+`ExportUtils`, `PdfToolsScreen`, dan (secara implisit lewat `import com.example.core.pdf.*`)
+kode lain yang butuh deteksi MIME type dari ekstensi berkas.
+
+## [Unreleased] - 2026-08-25
+### Fix: Deteksi 4-titik crop otomatis salah pilih garis tabel internal sebagai tepi kertas
+Root cause (ditemukan dari analisis frame-by-frame video pengujian): `AutoCropDetector.kt`
+mencari 4 sisi kertas independen, hanya berdasar kekuatan gradien — garis tabel/formulir
+internal yang kontras tinggi bisa mengalahkan tepi kertas asli dalam skor, terutama saat
+latar belakang foto gelap. Ditambahkan `brightnessBiasFactor()`: memprioritaskan kandidat
+garis yang sisi dalamnya (kertas) jelas lebih terang dari sisi luarnya (latar) — pola yang
+tidak dimiliki garis tabel internal (kedua sisinya sama-sama kertas terang). Ini yang
+menyebabkan hasil rectify/crop terlihat "miring" — bukan bug di perspective warp itu sendiri,
+tapi geometri sumber yang dikirim ke warp sudah salah bentuk. Detail di `docs/AUDIT_REPORT.md`.
+Belum diverifikasi di device fisik.
+
+### Fix: Filter "Mempertajam" masih terasa blur dibanding CamScanner
+Root cause: `applyUnsharpSharpen()` selalu pakai radius tetangga 1px, terlalu sempit untuk
+resolusi scan dokumen sehingga efek penajaman nyaris tak terlihat. Ditambahkan parameter
+`radius` (default 1, pemanggil lain tidak berubah), `applySuperSharpen()` sekarang memanggil
+dua pass (radius 1px + 3px) meniru unsharp mask multi-skala. Detail di `docs/AUDIT_REPORT.md`.
+Belum diverifikasi di device fisik.
+
 ## [Unreleased] - 2026-08-24
 ### Fix: Filter "Mempertajam"/"Magic Color" merusak bayangan hangat jadi noda kuning
 Root cause: cabang "preserve warna stempel/tanda tangan" (`chroma >= 20/22` → saturasi

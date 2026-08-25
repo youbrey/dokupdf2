@@ -1,5 +1,58 @@
 # DokuPDF — Laporan Audit
 
+## Investigasi Video Pengujian 2026-08-25 — Halaman Masih Miring & Filter Masih Blur
+
+**Input:** rekaman video 64 detik (`tes2.mp4`) perbandingan langsung CamScanner vs DokuPDF
+pada dokumen fisik yang sama, termasuk layar "Memotong" (crop 8-titik) yang menampilkan
+overlay deteksi otomatis.
+
+### 1. Root cause "halaman miring/tidak rata" — BUKAN di tahap warp, tapi di deteksi sudut
+
+Frame-by-frame video (di-extract dengan ffmpeg) menunjukkan overlay crop 8-titik otomatis
+salah menempatkan **sudut kanan-bawah di tengah halaman** — persis di garis pembatas tabel
+bagian "ISI DISPOSISI", BUKAN di tepi kertas sesungguhnya (yang masih ~30% lebih jauh ke
+bawah). `cropPerspective()` (perspective warp, `FilterProcessor.kt`) sendiri sudah benar
+secara matematis — `Matrix.setPolyToPoly` dengan 4 titik akan menghasilkan rectifikasi lurus
+sempurna KALAU 4 titik yang diberikan memang menandai 4 sudut kertas asli. Karena kuadrilateral
+yang dikirim ke sana sudah salah bentuk (bukan trapesium yang mewakili kertas persegi), hasil
+warp jadi terlihat "miring" — bukan gagal diluruskan, tapi diluruskan berdasarkan geometri
+sumber yang keliru.
+
+**Root cause di `AutoCropDetector.kt`:** 4 sisi (kiri/kanan/atas/bawah) dicari sepenuhnya
+independen, skor berbasis kekuatan gradien tepi + cakupan. Di dokumen dengan garis tabel/
+formulir internal yang panjang & kontras tinggi (tinta hitam di atas kertas putih), garis
+internal itu bisa punya skor gradien SAMA KUAT atau lebih kuat dari tepi kertas asli —
+apalagi saat latar belakang foto gelap/minim cahaya (seperti kondisi di video). Akibatnya
+algoritma memilih garis tabel internal sebagai "tepi kertas".
+
+**Fix:** ditambahkan `brightnessBiasFactor()` — pembeda yang sebelumnya tidak dipakai sama
+sekali: tepi kertas sungguhan punya lompatan kecerahan SATU ARAH (sisi dalam = kertas putih
+terang, sisi luar = latar lebih gelap), sedangkan garis tabel internal TIDAK (kedua sisinya
+sama-sama kertas putih). Skor tiap kandidat garis sekarang dikalikan faktor ini — kandidat
+dengan pola "sisi dalam lebih terang" yang meyakinkan diprioritaskan, tapi tidak ditolak
+mutlak kalau tidak ada (supaya dokumen di atas latar terang tetap terdeteksi lewat sinyal
+gradien seperti sebelumnya).
+
+### 2. Root cause "filter Mempertajam masih blur" — unsharp mask radius terlalu sempit
+
+`applyUnsharpSharpen()` (dipakai semua filter, termasuk "Mempertajam"/`applySuperSharpen`)
+selalu memakai radius tetangga tetap = 1 piksel sebagai estimasi "versi blur" untuk unsharp
+mask. Untuk resolusi scan dokumen (~2000px lebar), beda piksel-ke-piksel-langsung itu terlalu
+kecil untuk menghasilkan efek penajaman yang terlihat — walau `strength` dinaikkan, hasilnya
+tetap terasa lembek.
+
+**Fix:** `applyUnsharpSharpen()` sekarang menerima parameter `radius` (default 1, sehingga
+pemanggil lain tidak berubah perilakunya). `applySuperSharpen()` (filter "Mempertajam")
+sekarang memanggilnya DUA KALI dengan radius berbeda (1px lalu 3px) — meniru unsharp mask
+multi-skala: pass pertama menajamkan detail halus, pass kedua menajamkan kontras goresan
+huruf yang lebih lebar.
+
+**Belum diverifikasi di device fisik** — kedua fix berbasis analisis kode + bukti visual dari
+video (bukan re-run scan langsung; lingkungan pengembangan tidak punya Android SDK/device/
+emulator). Rekomendasi kuat: uji ulang persis dokumen & kondisi pencahayaan yang sama seperti
+di video (termasuk mencoba beberapa dokumen lain yang punya garis tabel/formulir internal
+untuk memastikan fix deteksi sudut tidak overfit ke satu kasus ini saja) sebelum rilis.
+
 ## Investigasi Laporan Pengguna 2026-08-24 — Filter "Mempertajam" Buruk & Crop Tidak Bisa Digeser
 
 **Input:** 2 screenshot perbandingan (CamScanner vs DokuPDF pada dokumen yang sama,
