@@ -73,22 +73,22 @@ object AutoCropDetector {
             val edgeThreshold = percentileThreshold(magnitudes, 0.78f).coerceAtLeast(14f)
 
             val left = findVerticalBoundary(
-                gradientX, gradientY, analysisWidth, analysisHeight,
+                luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
                 preferOuter = true, threshold = edgeThreshold
             )
             val right = findVerticalBoundary(
-                gradientX, gradientY, analysisWidth, analysisHeight,
+                luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
                 preferOuter = false, threshold = edgeThreshold
             )
             val top = findHorizontalBoundary(
-                gradientX, gradientY, analysisWidth, analysisHeight,
+                luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
                 preferOuter = true, threshold = edgeThreshold
             )
             val bottom = findHorizontalBoundary(
-                gradientX, gradientY, analysisWidth, analysisHeight,
+                luma, gradientX, gradientY, analysisWidth, analysisHeight,
                 minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
                 preferOuter = false, threshold = edgeThreshold
             )
@@ -196,6 +196,7 @@ object AutoCropDetector {
     }
 
     private fun findVerticalBoundary(
+        luma: FloatArray,
         gradientX: FloatArray,
         gradientY: FloatArray,
         width: Int,
@@ -208,6 +209,10 @@ object AutoCropDetector {
         val minBase = (width * minBaseFraction).roundToInt()
         val maxBase = (width * maxBaseFraction).roundToInt()
         val middleY = (height - 1) / 2f
+        // [Audit] Jarak sampel sisi dalam/luar untuk cek asimetri kecerahan, lihat dokumentasi
+        // di findHorizontalBoundary (logika identik, hanya sumbunya ditukar).
+        val sideOffset = (width * 0.045f).roundToInt().coerceIn(3, 24)
+        val innerSign = if (preferOuter) 1 else -1
         var best: LineModel? = null
 
         var slope = -0.70f
@@ -217,6 +222,9 @@ object AutoCropDetector {
                 var sum = 0f
                 var strong = 0
                 var valid = 0
+                var innerLumaSum = 0f
+                var outerLumaSum = 0f
+                var sideSamples = 0
                 for (y in 2 until height - 2 step 2) {
                     val x = (base + slope * (y - middleY)).roundToInt()
                     if (x !in 2 until width - 2) continue
@@ -225,12 +233,21 @@ object AutoCropDetector {
                     sum += min(response, threshold * 4f)
                     if (response >= threshold) strong++
                     valid++
+
+                    val innerX = x + innerSign * sideOffset
+                    val outerX = x - innerSign * sideOffset
+                    if (innerX in 0 until width && outerX in 0 until width) {
+                        innerLumaSum += luma[y * width + innerX]
+                        outerLumaSum += luma[y * width + outerX]
+                        sideSamples++
+                    }
                 }
                 if (valid == 0) continue
                 val coverage = strong.toFloat() / valid
                 val position = base.toFloat() / width
                 val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
-                val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior
+                val brightnessFactor = brightnessBiasFactor(innerLumaSum, outerLumaSum, sideSamples)
+                val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior * brightnessFactor
                 if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
             }
             slope += 0.05f
@@ -239,6 +256,7 @@ object AutoCropDetector {
     }
 
     private fun findHorizontalBoundary(
+        luma: FloatArray,
         gradientX: FloatArray,
         gradientY: FloatArray,
         width: Int,
@@ -251,6 +269,8 @@ object AutoCropDetector {
         val minBase = (height * minBaseFraction).roundToInt()
         val maxBase = (height * maxBaseFraction).roundToInt()
         val middleX = (width - 1) / 2f
+        val sideOffset = (height * 0.045f).roundToInt().coerceIn(3, 24)
+        val innerSign = if (preferOuter) 1 else -1
         var best: LineModel? = null
 
         var slope = -0.70f
@@ -260,6 +280,9 @@ object AutoCropDetector {
                 var sum = 0f
                 var strong = 0
                 var valid = 0
+                var innerLumaSum = 0f
+                var outerLumaSum = 0f
+                var sideSamples = 0
                 for (x in 2 until width - 2 step 2) {
                     val y = (base + slope * (x - middleX)).roundToInt()
                     if (y !in 2 until height - 2) continue
@@ -268,18 +291,58 @@ object AutoCropDetector {
                     sum += min(response, threshold * 4f)
                     if (response >= threshold) strong++
                     valid++
+
+                    val innerY = y + innerSign * sideOffset
+                    val outerY = y - innerSign * sideOffset
+                    if (innerY in 0 until height && outerY in 0 until height) {
+                        innerLumaSum += luma[innerY * width + x]
+                        outerLumaSum += luma[outerY * width + x]
+                        sideSamples++
+                    }
                 }
                 if (valid == 0) continue
                 val coverage = strong.toFloat() / valid
                 val position = base.toFloat() / height
                 val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
-                val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior
+                val brightnessFactor = brightnessBiasFactor(innerLumaSum, outerLumaSum, sideSamples)
+                val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior * brightnessFactor
                 if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
             }
             slope += 0.05f
         }
         return best
     }
+
+    /**
+     * [Audit — Tahap Refactor] Root cause pemotongan halaman yang tidak akurat/miring
+     * (dilaporkan pengguna lewat rekaman video, dibandingkan dengan CamScanner): 4 sisi
+     * dicari SEPENUHNYA independen satu sama lain, dan skornya sebelumnya HANYA berbasis
+     * kekuatan gradien + cakupan garis. Di dokumen dengan garis tabel/formulir internal yang
+     * panjang dan lurus (kontras tinta-hitam-di-atas-kertas-putih bisa SAMA KUAT atau lebih
+     * kuat dari kontras tepi-kertas-vs-latar, apalagi kalau latar belakang foto gelap/kurang
+     * cahaya seperti pada video pengujian), garis tabel internal itu bisa MENGALAHKAN tepi
+     * kertas asli dalam skor — persis yang terlihat: sudut kanan-bawah hasil deteksi berhenti
+     * di garis pembatas tabel "ISI DISPOSISI", bukan di tepi kertas sesungguhnya.
+     *
+     * Pembeda kunci yang selama ini tidak dipakai: tepi kertas sungguhan punya lompatan
+     * kecerahan SATU ARAH (sisi dalam = kertas putih terang, sisi luar = latar belakang
+     * biasanya lebih gelap/bertekstur). Garis tabel internal TIDAK punya pola ini — kedua
+     * sisinya sama-sama kertas putih (kecerahan hampir sama, selisih mendekati nol).
+     *
+     * Fungsi ini memberi bobot skor berdasarkan pola itu: dukungan penuh (x1.0) kalau sisi
+     * dalam jelas lebih terang dari sisi luar, diturunkan bertahap sampai minimum x0.35 kalau
+     * polanya terbalik/tidak ada — sengaja tidak menolak total (bukan hard filter) supaya
+     * dokumen dengan latar belakang terang (mis. discan di atas meja putih) masih bisa
+     * terdeteksi lewat sinyal gradien seperti sebelumnya, hanya kalah prioritas dibanding
+     * kandidat lain yang polanya lebih meyakinkan.
+     */
+    private fun brightnessBiasFactor(innerLumaSum: Float, outerLumaSum: Float, sideSamples: Int): Float {
+        if (sideSamples == 0) return 0.5f
+        val diff = (innerLumaSum - outerLumaSum) / sideSamples
+        return ((diff.coerceIn(-40f, 60f) + 40f) / 100f) * 0.65f + 0.35f
+    }
+
+
 
     /** Vertical line: x = a*y+b. Horizontal line: y = c*x+d. */
     private fun intersect(vertical: LineModel, horizontal: LineModel, width: Int, height: Int): Offset {
