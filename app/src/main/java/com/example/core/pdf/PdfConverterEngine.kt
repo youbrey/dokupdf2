@@ -68,14 +68,34 @@ class PdfConverterEngine(
     private val pageDrawPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
     /**
-     * Resamples and compresses a bitmap into a memory-efficient and compact JPEG stream
-     * for high-clarity, ultra-low byte size PDF embedding.
+     * Resamples and compresses a bitmap into a memory-efficient JPEG stream for PDF embedding.
+     *
+     * [Audit — perbaikan ketajaman/DPI] Root cause utama keluhan "teks sulit dibaca, hasil
+     * terasa seperti foto yang dicerahkan" dibanding CamScanner: nilai lama `maxDim = 1600f`
+     * di sini adalah bottleneck akhir yang DIPAKAI SEMUA jalur scan->PDF di kelas ini,
+     * termasuk saat pengguna sudah memilih mode "HD" (yang menangkap hingga 2600px di
+     * ScannerScreen.imageProxyToBitmap). Berapa pun resolusi hasil capture/filter sebelumnya,
+     * baris lama ini SELALU memampatkannya lagi ke 1600px sisi terpanjang sebelum ditulis ke
+     * PDF -- pada halaman A4 (11.69 in sisi panjang) itu setara ~137 DPI efektif, jauh di
+     * bawah ~200-300 DPI yang dibutuhkan supaya cetakan kecil/tulisan tangan tetap tajam saat
+     * dibaca atau di-zoom, dan jauh di bawah kualitas ekspor CamScanner. quality JPEG 82 juga
+     * menambah pelunakan di atas downscale itu.
+     *
+     * Nilai default dinaikkan ke 2480px (~settara 212 DPI di A4, sudah jelas lebih tajam dari
+     * hasil lama) dan quality JPEG ke 92. `targetLongEdgePx` dibuat dapat diisi pemanggil
+     * (mis. diselaraskan dengan toggle "HD" di UI) tanpa mengubah pemanggil yang sudah ada.
+     * createScaledBitmap TIDAK PERNAH memperbesar (hanya jalan kalau longest > target), jadi
+     * menaikkan angka ini tidak menciptakan detail palsu -- hanya berhenti membuang detail asli
+     * hasil capture/filter yang sebelumnya sudah ada.
      */
-    private fun prepareOptimizedBitmapForPdf(source: Bitmap): Bitmap {
-        val maxDim = 1600f
+    private fun prepareOptimizedBitmapForPdf(
+        source: Bitmap,
+        targetLongEdgePx: Float = 2480f,
+        jpegQuality: Int = 92
+    ): Bitmap {
         val longest = maxOf(source.width, source.height).toFloat()
-        val scaled = if (longest > maxDim) {
-            val scale = maxDim / longest
+        val scaled = if (longest > targetLongEdgePx) {
+            val scale = targetLongEdgePx / longest
             Bitmap.createScaledBitmap(
                 source,
                 (source.width * scale).toInt().coerceAtLeast(1),
@@ -89,7 +109,7 @@ class PdfConverterEngine(
         return try {
             // Compress via JPEG stream to strip 32-bit uncompressed raster bloat.
             val bytes = ByteArrayOutputStream().use { stream ->
-                if (!scaled.compress(Bitmap.CompressFormat.JPEG, 82, stream)) return source
+                if (!scaled.compress(Bitmap.CompressFormat.JPEG, jpegQuality, stream)) return source
                 stream.toByteArray()
             }
             BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: source
