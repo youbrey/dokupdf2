@@ -6,6 +6,14 @@
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- [Fitur baru] Diperlukan HANYA di API 24-28 untuk menyimpan berkas ke folder Download/
+         publik lewat java.io.File langsung (ExportUtils.kt). Di API 29+ (scoped storage),
+         penyimpanan ke Download/ dilakukan lewat MediaStore.Downloads yang TIDAK butuh izin
+         ini sama sekali -- maxSdkVersion="28" memastikan sistem otomatis tidak meminta/memberi
+         izin ini di API 29+ (izin akan diabaikan Play Console & runtime di versi lebih baru). -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <application
         android:allowBackup="true"
