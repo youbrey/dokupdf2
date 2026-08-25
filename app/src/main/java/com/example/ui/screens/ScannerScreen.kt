@@ -90,7 +90,16 @@ data class ScannedPageItem(
     val filterType: FilterType = FilterType.AUTO,
     val filterSettings: FilterSettings = FilterSettings(),
     val watermarkText: String? = null,
-    val ocrText: String? = null
+    val ocrText: String? = null,
+    // [Audit — perbaikan kualitas crop] True saat AutoCropDetector gagal mendeteksi tepi
+    // dokumen (detection.usedFallback) dan geometri jatuh ke defaultGeometry() (crop hampir
+    // penuh-frame, HANYA memangkas margin 4%). Sebelumnya kegagalan ini hanya dicatat ke
+    // Logcat dan halaman tetap disimpan apa adanya -- hasil foto mentah yang masih miring dan
+    // menyertakan latar belakang lolos begitu saja ke PDF akhir tanpa sepengetahuan pengguna.
+    // Dipakai oleh pemanggil capture/import untuk memaksa halaman ini langsung dibuka di
+    // InteractiveCropScreen agar pengguna mengoreksi 4 titik sudut secara manual sebelum
+    // halaman ikut ke tahap filter/simpan PDF.
+    val needsManualCrop: Boolean = false
 ) {
     fun getRenderedBitmap(maxDimension: Int? = null): Bitmap {
         require(!originalBitmap.isRecycled && originalBitmap.width > 0 && originalBitmap.height > 0) {
@@ -1138,6 +1147,23 @@ fun ScannerScreen(
                                                             if (captureMode == ScanMode.SINGLE_PAGE) {
                                                                 isReviewMode = true
                                                             }
+                                                            // [Audit — perbaikan kualitas crop] Sebelumnya kegagalan deteksi tepi
+                                                            // (usedFallback) hanya di-log dan halaman near-full-frame yang masih
+                                                            // miring/menyertakan latar belakang lolos diam-diam ke tahap
+                                                            // filter/simpan. Sekarang halaman semacam ini otomatis membuka
+                                                            // InteractiveCropScreen agar pengguna mengoreksi 4 titik sudut
+                                                            // secara manual sebelum melanjutkan -- ini konsisten dengan alur
+                                                            // CamScanner/Office Lens yang selalu meminta konfirmasi crop saat
+                                                            // deteksi otomatis tidak yakin.
+                                                            if (page.needsManualCrop) {
+                                                                isReviewMode = true
+                                                                cropTargetPageIndex = scannedPages.lastIndex
+                                                                Toast.makeText(
+                                                                    context,
+                                                                    "Tepi dokumen tidak terdeteksi otomatis. Sesuaikan crop secara manual.",
+                                                                    Toast.LENGTH_LONG
+                                                                ).show()
+                                                            }
                                                         }
                                                     }
                                                 } catch (_: OutOfMemoryError) {
@@ -2054,7 +2080,11 @@ private fun createAutoCroppedPage(bitmap: Bitmap, mode: ScanMode): ScannedPageIt
     return ScannedPageItem(
         originalBitmap = bitmap,
         cropGeometry = detection.geometry,
-        filterType = filterForScanMode(mode)
+        filterType = filterForScanMode(mode),
+        // [Audit] Lihat catatan di ScannedPageItem.needsManualCrop -- ini flag yang dipakai
+        // callback capture/import untuk auto-membuka InteractiveCropScreen alih-alih diam-diam
+        // menerima crop hampir-penuh-frame yang masih miring/menyertakan latar belakang.
+        needsManualCrop = detection.usedFallback
     )
 }
 
