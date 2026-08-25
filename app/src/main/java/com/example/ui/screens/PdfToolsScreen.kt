@@ -48,6 +48,7 @@ import com.example.core.ai.GeminiAiService
 import com.example.core.pdf.*
 import com.example.core.repository.SavedDocumentItem
 import com.example.ui.components.SleekTopAppBar
+import com.example.ui.components.rememberStorageExportGate
 import com.example.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -101,34 +102,24 @@ fun PdfToolsScreen(
     // [Fitur baru] "Simpan ke Perangkat" -- lihat ExportUtils.kt untuk penjelasan lengkap
     // kenapa fitur ini belum pernah ada sebelumnya (proyek hanya punya jalur share sheet).
     var isSavingToDevice by remember { mutableStateOf(false) }
-    // Menyimpan file yang MENUNGGU diekspor selagi izin runtime diminta (khusus API 24-28) --
-    // supaya begitu izin diberikan, ekspor langsung lanjut tanpa pengguna menekan tombol lagi.
-    var pendingSaveFiles by remember { mutableStateOf<List<File>?>(null) }
 
-    val savePermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        val filesToSave = pendingSaveFiles
-        pendingSaveFiles = null
-        if (granted && filesToSave != null) {
-            scope.launch { performSaveToDevice(context, filesToSave) { isSavingToDevice = it } }
-        } else if (!granted) {
+    // [Refactor] Dance permintaan izin runtime (API 24-28) diekstrak ke
+    // rememberStorageExportGate -- lihat ui/components/ExportPermissionGate.kt untuk alasan.
+    val requestExportPermission = rememberStorageExportGate(
+        onPermissionDenied = {
             Toast.makeText(
                 context,
                 "Izin penyimpanan diperlukan untuk menyimpan berkas ke Download",
                 Toast.LENGTH_LONG
             ).show()
         }
-    }
+    )
 
     fun saveResultFilesToDevice(files: List<File>) {
         if (files.isEmpty()) return
-        if (ExportUtils.requiresLegacyPermission() && !ExportUtils.hasLegacyStoragePermission(context)) {
-            pendingSaveFiles = files
-            savePermissionLauncher.launch(ExportUtils.LEGACY_WRITE_PERMISSION)
-            return
+        requestExportPermission {
+            scope.launch { performSaveToDevice(context, files) { isSavingToDevice = it } }
         }
-        scope.launch { performSaveToDevice(context, files) { isSavingToDevice = it } }
     }
 
     // Dynamic parameter states

@@ -68,6 +68,7 @@ import com.example.core.pdf.ExportUtils
 import com.example.core.pdf.PdfConverterEngine
 import com.example.core.pdf.PdfFileUtils
 import com.example.core.pdf.PdfRendererEngine
+import com.example.ui.components.rememberStorageExportGate
 import com.example.ui.theme.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -299,7 +300,6 @@ fun ScannerScreen(
     // [Fitur baru] "Simpan ke Perangkat" -- lihat ExportUtils.kt & PdfToolsScreen.kt
     // (fungsi performSaveToDevice) untuk penjelasan lengkap kenapa fitur ini ditambahkan.
     var isSavingToDevice by remember { mutableStateOf(false) }
-    var pendingDeviceSaveFile by remember { mutableStateOf<File?>(null) }
 
     suspend fun doExportToDevice(file: File) {
         isSavingToDevice = true
@@ -317,25 +317,17 @@ fun ScannerScreen(
         }
     }
 
-    val savePermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        val fileToSave = pendingDeviceSaveFile
-        pendingDeviceSaveFile = null
-        if (granted && fileToSave != null) {
-            scope.launch { doExportToDevice(fileToSave) }
-        } else if (!granted) {
+    // [Refactor] Dance permintaan izin runtime (API 24-28) diekstrak ke
+    // rememberStorageExportGate -- lihat ui/components/ExportPermissionGate.kt untuk alasan
+    // (sebelumnya logika ini nyaris identik dengan yang ada di PdfToolsScreen.kt).
+    val requestExportPermission = rememberStorageExportGate(
+        onPermissionDenied = {
             Toast.makeText(context, "Izin penyimpanan diperlukan untuk menyimpan ke Download", Toast.LENGTH_LONG).show()
         }
-    }
+    )
 
     fun saveScannedPdfToDevice(file: File) {
-        if (ExportUtils.requiresLegacyPermission() && !ExportUtils.hasLegacyStoragePermission(context)) {
-            pendingDeviceSaveFile = file
-            savePermissionLauncher.launch(ExportUtils.LEGACY_WRITE_PERMISSION)
-            return
-        }
-        scope.launch { doExportToDevice(file) }
+        requestExportPermission { scope.launch { doExportToDevice(file) } }
     }
 
     // CameraX controllers
