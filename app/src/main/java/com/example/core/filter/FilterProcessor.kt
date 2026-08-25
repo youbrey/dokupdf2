@@ -264,8 +264,13 @@ object FilterProcessor {
             }
         }
 
-        // Apply stronger unsharp sharpening
-        applyUnsharpSharpen(outPixels, width, height, strength = 0.85f)
+        // [Audit] Dua pass unsharp mask skala berbeda (radius 1px lalu 3px) — bukan satu pass
+        // radius=1 seperti sebelumnya. Radius kecil menajamkan detail halus/tepi huruf tipis,
+        // radius lebih besar menajamkan kontras goresan yang lebih lebar. Kombinasi ini yang
+        // sebelumnya hilang dan bikin hasil "Mempertajam" tetap terasa lembek dibanding
+        // CamScanner meski sudah lewat normalisasi latar & pemetaan kontras di atas.
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.55f, radius = 1)
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.5f, radius = 3)
 
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         output.setPixels(outPixels, 0, width, 0, 0, width, height)
@@ -639,18 +644,32 @@ object FilterProcessor {
     /**
      * Fast 3x3 unsharp text sharpener kernel applied selectively to non-white pixels
      */
-    private fun applyUnsharpSharpen(pixels: IntArray, width: Int, height: Int, strength: Float) {
+    /**
+     * [Audit — Tahap Refactor] Fix "hasil Mempertajam masih terasa blur dibanding CamScanner".
+     * Sebelumnya fungsi ini SELALU memakai radius tetangga = 1 piksel (hanya kiri/kanan/atas/
+     * bawah langsung) sebagai estimasi "versi blur" dari gambar untuk unsharp mask. Radius
+     * 1px terlalu sempit untuk resolusi scan dokumen (biasanya ~2000px lebar) — bedanya
+     * dengan piksel tetangga langsung sangat kecil, jadi efek "pertajam" yang dihasilkan nyaris
+     * tidak terlihat, hasil akhir tetap terasa lembek/blur meski strength dinaikkan.
+     * Parameter `radius` (px, di skala gambar sebenarnya, BUKAN dinormalisasi) sekarang bisa
+     * diatur oleh pemanggil. Filter "Mempertajam" (applySuperSharpen) memanggil fungsi ini DUA
+     * kali dengan radius berbeda (1px lalu 3px) — meniru unsharp mask multi-skala: pass
+     * pertama menajamkan detail halus, pass kedua menajamkan kontras goresan huruf yang lebih
+     * lebar, mendekati hasil "Ajaib Pro" CamScanner. Pemanggil lain (AUTO/adjustments slider)
+     * sengaja TETAP di radius=1 (default) agar tampilannya tidak berubah dari sebelumnya.
+     */
+    private fun applyUnsharpSharpen(pixels: IntArray, width: Int, height: Int, strength: Float, radius: Int = 1) {
         val temp = pixels.clone()
         val w = width
         val h = height
+        val r = radius.coerceAtLeast(1)
 
-        val step = 1
-        for (y in 1 until h - 1) {
+        for (y in r until h - r) {
             val rowOffset = y * w
-            val rowAbove = (y - 1) * w
-            val rowBelow = (y + 1) * w
+            val rowAbove = (y - r) * w
+            val rowBelow = (y + r) * w
 
-            for (x in 1 until w - 1) {
+            for (x in r until w - r) {
                 val center = temp[rowOffset + x]
                 // If pixel is already pure white, keep it pure white (avoid noise on clean paper)
                 if (center == 0xFFFFFFFF.toInt()) continue
@@ -659,8 +678,8 @@ object FilterProcessor {
                 val cg = (center shr 8) and 0xFF
                 val cb = center and 0xFF
 
-                val left = temp[rowOffset + x - 1]
-                val right = temp[rowOffset + x + 1]
+                val left = temp[rowOffset + x - r]
+                val right = temp[rowOffset + x + r]
                 val up = temp[rowAbove + x]
                 val down = temp[rowBelow + x]
 
