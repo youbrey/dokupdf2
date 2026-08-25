@@ -236,6 +236,10 @@ object AutoCropDetector {
         // di findHorizontalBoundary (logika identik, hanya sumbunya ditukar).
         val sideOffset = (width * 0.045f).roundToInt().coerceIn(3, 24)
         val innerSign = if (preferOuter) 1 else -1
+        // The global percentile is often set by black table rules on white paper. A legitimate
+        // paper/background edge has lower contrast, so use a slightly softer bar for continuity
+        // while retaining the full threshold for response-score normalization.
+        val coverageThreshold = max(14f, threshold * 0.72f)
         val candidates = ArrayList<LineModel>()
 
         var slope = -0.70f
@@ -251,10 +255,19 @@ object AutoCropDetector {
                 for (y in 2 until height - 2 step 2) {
                     val x = (base + slope * (y - middleY)).roundToInt()
                     if (x !in 2 until width - 2) continue
-                    val index = y * width + x
-                    val response = abs(gradientX[index] - slope * gradientY[index]) / normalLength
+                    var response = 0f
+                    // Search a narrow band normal to the proposed line. Quantized slope/base
+                    // values otherwise miss a genuine one-pixel page boundary while perfectly
+                    // aligned table rules keep full coverage.
+                    for (offset in -2..2) {
+                        val index = y * width + x + offset
+                        response = max(
+                            response,
+                            abs(gradientX[index] - slope * gradientY[index]) / normalLength
+                        )
+                    }
                     sum += min(response, threshold * 4f)
-                    if (response >= threshold) strong++
+                    if (response >= coverageThreshold) strong++
                     valid++
 
                     val innerX = x + innerSign * sideOffset
@@ -298,6 +311,7 @@ object AutoCropDetector {
         val middleX = (width - 1) / 2f
         val sideOffset = (height * 0.045f).roundToInt().coerceIn(3, 24)
         val innerSign = if (preferOuter) 1 else -1
+        val coverageThreshold = max(14f, threshold * 0.72f)
         val candidates = ArrayList<LineModel>()
 
         var slope = -0.70f
@@ -313,10 +327,16 @@ object AutoCropDetector {
                 for (x in 2 until width - 2 step 2) {
                     val y = (base + slope * (x - middleX)).roundToInt()
                     if (y !in 2 until height - 2) continue
-                    val index = y * width + x
-                    val response = abs(gradientY[index] - slope * gradientX[index]) / normalLength
+                    var response = 0f
+                    for (offset in -2..2) {
+                        val index = (y + offset) * width + x
+                        response = max(
+                            response,
+                            abs(gradientY[index] - slope * gradientX[index]) / normalLength
+                        )
+                    }
                     sum += min(response, threshold * 4f)
-                    if (response >= threshold) strong++
+                    if (response >= coverageThreshold) strong++
                     valid++
 
                     val innerY = y + innerSign * sideOffset
@@ -374,6 +394,7 @@ object AutoCropDetector {
         val maximumBottomScore = bottomCandidates.maxOfOrNull { it.score }?.coerceAtLeast(0.001f) ?: return null
 
         var best: GeometryCandidate? = null
+        var bestSupported: GeometryCandidate? = null
         for (left in leftCandidates) {
             for (right in rightCandidates) {
                 for (top in topCandidates) {
@@ -411,6 +432,10 @@ object AutoCropDetector {
                         val averageCoverage = (
                             left.coverage + right.coverage + top.coverage + bottom.coverage
                             ) * 0.25f
+                        val minimumCoverage = min(
+                            min(left.coverage, right.coverage),
+                            min(top.coverage, bottom.coverage)
+                        )
                         val coverageScore = (averageCoverage / 0.32f).coerceIn(0f, 1f)
 
                         // Page area receives the largest weight on purpose. Internal table lines can
@@ -423,21 +448,30 @@ object AutoCropDetector {
                                 coverageScore * 0.13f +
                                 shapeScore * 0.08f
                             ).coerceIn(0f, 1f)
-                        if (best == null || jointScore > best.jointScore) {
-                            best = GeometryCandidate(
-                                geometry = geometry,
-                                left = left,
-                                right = right,
-                                top = top,
-                                bottom = bottom,
-                                jointScore = jointScore
-                            )
+                        val candidate = GeometryCandidate(
+                            geometry = geometry,
+                            left = left,
+                            right = right,
+                            top = top,
+                            bottom = bottom,
+                            jointScore = jointScore
+                        )
+                        if (best == null || jointScore > best.jointScore) best = candidate
+
+                        // Area is intentionally the dominant term, but it must never promote a
+                        // largely imaginary outer line over a quadrilateral whose four sides are
+                        // actually observed. Keep the best unconstrained candidate only so flat
+                        // images still produce the precise `insufficient_edge_coverage` reason.
+                        if (minimumCoverage >= 0.055f &&
+                            (bestSupported == null || jointScore > bestSupported.jointScore)
+                        ) {
+                            bestSupported = candidate
                         }
                     }
                 }
             }
         }
-        return best
+        return bestSupported ?: best
     }
 
     /**
