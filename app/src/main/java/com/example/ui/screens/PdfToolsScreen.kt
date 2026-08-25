@@ -1,15 +1,18 @@
 package com.example.ui.screens
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -94,6 +97,39 @@ fun PdfToolsScreen(
     var copyableResultText by remember { mutableStateOf<String?>(null) }
     var resultFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     var resultIsError by remember { mutableStateOf(false) }
+
+    // [Fitur baru] "Simpan ke Perangkat" -- lihat ExportUtils.kt untuk penjelasan lengkap
+    // kenapa fitur ini belum pernah ada sebelumnya (proyek hanya punya jalur share sheet).
+    var isSavingToDevice by remember { mutableStateOf(false) }
+    // Menyimpan file yang MENUNGGU diekspor selagi izin runtime diminta (khusus API 24-28) --
+    // supaya begitu izin diberikan, ekspor langsung lanjut tanpa pengguna menekan tombol lagi.
+    var pendingSaveFiles by remember { mutableStateOf<List<File>?>(null) }
+
+    val savePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val filesToSave = pendingSaveFiles
+        pendingSaveFiles = null
+        if (granted && filesToSave != null) {
+            scope.launch { performSaveToDevice(context, filesToSave) { isSavingToDevice = it } }
+        } else if (!granted) {
+            Toast.makeText(
+                context,
+                "Izin penyimpanan diperlukan untuk menyimpan berkas ke Download",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    fun saveResultFilesToDevice(files: List<File>) {
+        if (files.isEmpty()) return
+        if (ExportUtils.requiresLegacyPermission() && !ExportUtils.hasLegacyStoragePermission(context)) {
+            pendingSaveFiles = files
+            savePermissionLauncher.launch(ExportUtils.LEGACY_WRITE_PERMISSION)
+            return
+        }
+        scope.launch { performSaveToDevice(context, files) { isSavingToDevice = it } }
+    }
 
     // Dynamic parameter states
     val inAppPdfDocs = remember(documents) { documents.filter { it.file.extension.equals("pdf", ignoreCase = true) } }
@@ -832,17 +868,39 @@ fun PdfToolsScreen(
                                     }
 
                                     if (resultFiles.isNotEmpty()) {
-                                        Button(
-                                            onClick = { shareResultFiles(resultFiles) },
-                                            colors = ButtonDefaults.buttonColors(containerColor = AccentEmerald),
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
                                             modifier = Modifier.align(Alignment.End)
                                         ) {
-                                            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text(
-                                                if (resultFiles.size == 1) "Bagikan Hasil" else "Bagikan ${resultFiles.size} Hasil",
-                                                fontSize = 12.sp
-                                            )
+                                            // [Fitur baru] "Simpan ke Perangkat" -- ExportUtils.kt.
+                                            // Sebelumnya hanya ada "Bagikan Hasil" (share sheet);
+                                            // tombol ini menyalin berkas ke Download/DokuPDF/ publik
+                                            // supaya bisa dibuka lewat aplikasi File Manager/Galeri
+                                            // tanpa harus melalui aplikasi perantara lain.
+                                            OutlinedButton(
+                                                onClick = { saveResultFilesToDevice(resultFiles) },
+                                                enabled = !isSavingToDevice,
+                                                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentEmerald)
+                                            ) {
+                                                if (isSavingToDevice) {
+                                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                                } else {
+                                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                }
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text("Simpan ke Perangkat", fontSize = 12.sp)
+                                            }
+                                            Button(
+                                                onClick = { shareResultFiles(resultFiles) },
+                                                colors = ButtonDefaults.buttonColors(containerColor = AccentEmerald)
+                                            ) {
+                                                Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    if (resultFiles.size == 1) "Bagikan Hasil" else "Bagikan ${resultFiles.size} Hasil",
+                                                    fontSize = 12.sp
+                                                )
+                                            }
                                         }
                                     }
 
@@ -1764,12 +1822,47 @@ fun ToolGridCard(
     }
 }
 
-private fun mimeTypeFor(file: File): String = when (file.extension.lowercase(Locale.ROOT)) {
-    "pdf" -> "application/pdf"
-    "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    "csv" -> "text/csv"
-    "jpg", "jpeg" -> "image/jpeg"
-    "png" -> "image/png"
-    "dokupdf" -> "application/octet-stream"
-    else -> "application/octet-stream"
+// [Refactor] fungsi mimeTypeFor() dipindahkan ke com.example.core.pdf.ExportUtils.kt supaya
+// satu sumber kebenaran dipakai bersama oleh layar ini dan ExportUtils (fitur "Simpan ke
+// Perangkat"). Lihat import mimeTypeFor di atas.
+
+/**
+ * [Fitur baru] Menyimpan satu atau banyak berkas hasil PDF Tools ke Download/DokuPDF/ publik
+ * lewat [ExportUtils]. Dipanggil dari [PdfToolsScreen] tombol "Simpan ke Perangkat".
+ * Menampilkan Toast ringkasan hasil -- jujur soal berkas mana yang gagal jika ada, bukan
+ * pesan sukses generik ketika sebagian ekspor sebenarnya gagal.
+ */
+private suspend fun performSaveToDevice(
+    context: Context,
+    files: List<File>,
+    onBusyChange: (Boolean) -> Unit
+) {
+    onBusyChange(true)
+    try {
+        val results = ExportUtils.exportAllToDownloads(context, files)
+        val successes = results.count { it.second is ExportUtils.ExportResult.Success }
+        val permissionDenied = results.any { it.second is ExportUtils.ExportResult.PermissionRequired }
+        val failures = results.mapNotNull { (file, result) ->
+            (result as? ExportUtils.ExportResult.Failure)?.let { "${file.name}: ${it.message}" }
+        }
+
+        val message = when {
+            permissionDenied -> "Izin penyimpanan belum diberikan -- berkas tidak disimpan."
+            successes == results.size -> if (successes == 1) {
+                val path = (results.first().second as ExportUtils.ExportResult.Success).displayPath
+                "Tersimpan ke $path"
+            } else {
+                "$successes berkas tersimpan ke Download/${ExportUtils.EXPORT_SUBFOLDER}/"
+            }
+            successes > 0 -> "$successes dari ${results.size} berkas tersimpan. Gagal: ${failures.joinToString("; ")}"
+            else -> "Gagal menyimpan berkas: ${failures.joinToString("; ")}"
+        }
+
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+    } catch (t: Throwable) {
+        Log.e("PdfToolsScreen", "Gagal menyimpan ke perangkat: ${t.message}", t)
+        Toast.makeText(context, "Gagal menyimpan ke perangkat: ${t.message}", Toast.LENGTH_LONG).show()
+    } finally {
+        onBusyChange(false)
+    }
 }

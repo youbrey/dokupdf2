@@ -64,6 +64,7 @@ import com.example.core.model.CropGeometry
 import com.example.core.model.FilterSettings
 import com.example.core.model.FilterType
 import com.example.core.ocr.OcrEngine
+import com.example.core.pdf.ExportUtils
 import com.example.core.pdf.PdfConverterEngine
 import com.example.core.pdf.PdfFileUtils
 import com.example.core.pdf.PdfRendererEngine
@@ -294,6 +295,48 @@ fun ScannerScreen(
 
     // Success dialog state
     var savedPdfFile by remember { mutableStateOf<File?>(null) }
+
+    // [Fitur baru] "Simpan ke Perangkat" -- lihat ExportUtils.kt & PdfToolsScreen.kt
+    // (fungsi performSaveToDevice) untuk penjelasan lengkap kenapa fitur ini ditambahkan.
+    var isSavingToDevice by remember { mutableStateOf(false) }
+    var pendingDeviceSaveFile by remember { mutableStateOf<File?>(null) }
+
+    suspend fun doExportToDevice(file: File) {
+        isSavingToDevice = true
+        try {
+            when (val result = ExportUtils.exportToDownloads(context, file)) {
+                is ExportUtils.ExportResult.Success ->
+                    Toast.makeText(context, "Tersimpan ke ${result.displayPath}", Toast.LENGTH_LONG).show()
+                is ExportUtils.ExportResult.Failure ->
+                    Toast.makeText(context, "Gagal menyimpan: ${result.message}", Toast.LENGTH_LONG).show()
+                ExportUtils.ExportResult.PermissionRequired ->
+                    Toast.makeText(context, "Izin penyimpanan diperlukan", Toast.LENGTH_SHORT).show()
+            }
+        } finally {
+            isSavingToDevice = false
+        }
+    }
+
+    val savePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val fileToSave = pendingDeviceSaveFile
+        pendingDeviceSaveFile = null
+        if (granted && fileToSave != null) {
+            scope.launch { doExportToDevice(fileToSave) }
+        } else if (!granted) {
+            Toast.makeText(context, "Izin penyimpanan diperlukan untuk menyimpan ke Download", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    fun saveScannedPdfToDevice(file: File) {
+        if (ExportUtils.requiresLegacyPermission() && !ExportUtils.hasLegacyStoragePermission(context)) {
+            pendingDeviceSaveFile = file
+            savePermissionLauncher.launch(ExportUtils.LEGACY_WRITE_PERMISSION)
+            return
+        }
+        scope.launch { doExportToDevice(file) }
+    }
 
     // CameraX controllers
     var imageCapture: ImageCapture? by remember { mutableStateOf(null) }
@@ -1420,24 +1463,45 @@ fun ScannerScreen(
                 }
             },
             dismissButton = {
-                TextButton(
-                    onClick = {
-                        try {
-                            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                type = "application/pdf"
-                                putExtra(Intent.EXTRA_STREAM, uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            context.startActivity(Intent.createChooser(shareIntent, "Bagikan PDF"))
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "Gagal membagikan: ${e.message}", Toast.LENGTH_SHORT).show()
-                        }
-                    }
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Bagikan")
+                    // [Fitur baru] "Simpan ke Perangkat" -- lihat ExportUtils.kt. Sebelumnya
+                    // dialog ini hanya punya "Bagikan" (share sheet); tombol ini menyalin PDF
+                    // ke Download/DokuPDF/ publik supaya bisa dibuka lewat File Manager/Galeri
+                    // tanpa aplikasi perantara -- setara "Simpan ke Galeri" di CamScanner.
+                    TextButton(
+                        onClick = { saveScannedPdfToDevice(file) },
+                        enabled = !isSavingToDevice
+                    ) {
+                        if (isSavingToDevice) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                        }
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Simpan ke Perangkat")
+                    }
+                    TextButton(
+                        onClick = {
+                            try {
+                                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "application/pdf"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(Intent.createChooser(shareIntent, "Bagikan PDF"))
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Gagal membagikan: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Bagikan")
+                    }
                 }
             }
         )
