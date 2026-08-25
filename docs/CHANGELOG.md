@@ -1,23 +1,5 @@
 # DokuPDF - Project Changelog
 
-## [Unreleased] - 2026-08-25 (Auto-Crop/Dewarp V2)
-
-### Refactor: Pipeline pemindaian setara kelas CamScanner
-
-- `AutoCropDetector` sekarang mengevaluasi beberapa kandidat sisi sebagai satu quadrilateral,
-  sehingga garis tabel internal tidak lagi dipilih hanya karena gradiennya paling kuat.
-- Ditambahkan `DocumentDewarpProcessor`: mesh warp berbasis garis/baseline dokumen untuk
-  meratakan kelengkungan fisik yang tidak dapat dikoreksi oleh homografi empat sudut.
-- Filter `AUTO` memakai profil kertas+tinta, normalisasi pencahayaan lokal berbasis persentil,
-  serta sharpening dua skala. `NO_SHADOW` memperoleh penguatan tepi ringan.
-- Mode HD/impor mempertahankan sisi panjang hingga 3008 px; batas ekspor diselaraskan ke
-  sekitar 257 DPI A4 dan JPEG encode-decode perantara yang melunakkan teks dihapus.
-- Konfirmasi crop kini menyimpan geometri dan melakukan render secara lazy; crop/dewarp
-  resolusi penuh tidak lagi dihitung lalu langsung dibuang.
-- Ditambahkan regresi untuk garis tabel internal, kertas melengkung, foto non-dokumen, dan
-  normalisasi bayangan. Bukti perbandingan lengkap ada di
-  `docs/CROP_FILTER_REFACTOR_2026-08-25.md`.
-
 ## [Unreleased] - 2026-08-25 (lanjutan)
 ### Fitur Baru: "Simpan ke Perangkat" (setara "Simpan ke Galeri" CamScanner)
 **Root cause keluhan "tidak bisa menyimpan/ekspor":** seluruh proyek sebelumnya tidak
