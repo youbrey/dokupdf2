@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.dokupdf2">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
@@ -10,7 +9,7 @@
     <!-- [Fitur baru] Diperlukan HANYA di API 24-28 untuk menyimpan berkas ke folder Download/
          publik lewat java.io.File langsung (ExportUtils.kt). Di API 29+ (scoped storage),
          penyimpanan ke Download/ dilakukan lewat MediaStore.Downloads yang TIDAK butuh izin
-         ini sama sekali -- maxSdkVersion="28" memastikan sistem otomatis tidak meminta/memberi
+         ini sama sekali; maxSdkVersion="28" memastikan sistem otomatis tidak meminta/memberi
          izin ini di API 29+ (izin akan diabaikan Play Console & runtime di versi lebih baru). -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
