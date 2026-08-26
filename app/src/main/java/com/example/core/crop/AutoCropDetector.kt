@@ -21,17 +21,47 @@ data class AutoCropResult(
 /**
  * On-device document boundary detector that does not require OpenCV.
  *
- * The previous implementation stretched every image to a 300x300 square and sampled only
- * four diagonal rays. That distorted portrait documents and frequently locked onto text or
- * table lines instead of the page boundary. This detector preserves aspect ratio, builds
- * directional Sobel gradients, searches four continuous boundary lines, intersects those
- * lines, and rejects non-convex or implausibly small quadrilaterals.
+ * [Audit — Refactor v2] Root cause of crooked/wavy crops vs. CamScanner (reported by user via
+ * side-by-side video comparison): the previous single-tier detector searched each of the 4 sides
+ * COMPLETELY INDEPENDENTLY as a near-straight gradient line. On a real form with internal ruled
+ * table lines (ink-on-white contrast can rival or exceed the true paper-vs-background contrast,
+ * especially with a dim/textured background like a desk), a side's independent search regularly
+ * locked onto an internal table border instead of the true paper edge -- confirmed directly from
+ * the user's screen recording: the detector fell back to the plain centered default box (no real
+ * quadrilateral was found at all) on a photo where the paper was visibly rotated, so the final
+ * crop kept the tilt entirely uncorrected.
+ *
+ * This rewrite adds a PRIMARY detector that looks at the document as one connected shape instead
+ * of four unrelated lines, which is the same fundamental strategy CamScanner-class scanners use:
+ *
+ *   1. Otsu-threshold the (blurred) luminance into two populations, and use whichever population
+ *      contains the frame's CENTER pixel as the "document" class -- this works whether the paper
+ *      is brighter or darker than its background, and does not care whether the document itself
+ *      contains printed lines (those become small interior holes, not boundary evidence).
+ *   2. Morphologically close the resulting mask (dilate then erode) to bridge thin dark ruled
+ *      lines/text inside the paper without growing the true outer silhouette.
+ *   3. Flood-fill to the largest connected component -- this is the document's silhouette as one
+ *      global shape, immune to any single internal line "winning" a local contest.
+ *   4. Take that shape's boundary pixels, compute their convex hull, and extract the 4 extreme
+ *      corners (min/max of x+y and x-y). This finds the true 4-point quadrilateral -- including
+ *      full keystone/perspective skew, not just axis-aligned rotation -- at any rotation angle.
+ *
+ * The previous four-independent-lines search is KEPT as a secondary fallback (unchanged, see
+ * [detectByEdgeLines]) for the rare case where the primary region method can't find a confident
+ * single connected shape (e.g. the document and background have near-identical brightness).
  */
 object AutoCropDetector {
 
-    private const val ANALYSIS_LONG_EDGE = 420
+    private const val ANALYSIS_LONG_EDGE = 640
     private const val MIN_DOCUMENT_AREA = 0.18f
     private const val MIN_EDGE_FRACTION = 0.18f
+
+    /** Minimum/maximum plausible fraction of the frame the document silhouette may occupy. */
+    private const val MIN_REGION_COVERAGE = 0.10f
+    private const val MAX_REGION_COVERAGE = 0.97f
+
+    /** Radius (in analysis-resolution pixels) used to close small gaps/holes from ruled lines. */
+    private const val MORPH_CLOSE_RADIUS = 3
 
     private data class LineModel(
         val slope: Float,
@@ -39,6 +69,8 @@ object AutoCropDetector {
         val score: Float,
         val coverage: Float
     )
+
+    private data class IntPoint(val x: Int, val y: Int)
 
     fun detectDocumentCorners(bitmap: Bitmap): CropGeometry = detect(bitmap).geometry
 
@@ -65,64 +97,385 @@ object AutoCropDetector {
             val pixels = IntArray(analysisWidth * analysisHeight)
             analysisBitmap.getPixels(pixels, 0, analysisWidth, 0, 0, analysisWidth, analysisHeight)
             val luma = blurLuminance(pixels, analysisWidth, analysisHeight)
+
             val gradientX = FloatArray(luma.size)
             val gradientY = FloatArray(luma.size)
             val magnitudes = FloatArray(luma.size)
-
             computeSobel(luma, analysisWidth, analysisHeight, gradientX, gradientY, magnitudes)
-            val edgeThreshold = percentileThreshold(magnitudes, 0.78f).coerceAtLeast(14f)
 
-            val left = findVerticalBoundary(
-                luma, gradientX, gradientY, analysisWidth, analysisHeight,
-                minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
-                preferOuter = true, threshold = edgeThreshold
-            )
-            val right = findVerticalBoundary(
-                luma, gradientX, gradientY, analysisWidth, analysisHeight,
-                minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
-                preferOuter = false, threshold = edgeThreshold
-            )
-            val top = findHorizontalBoundary(
-                luma, gradientX, gradientY, analysisWidth, analysisHeight,
-                minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
-                preferOuter = true, threshold = edgeThreshold
-            )
-            val bottom = findHorizontalBoundary(
-                luma, gradientX, gradientY, analysisWidth, analysisHeight,
-                minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
-                preferOuter = false, threshold = edgeThreshold
-            )
-
-            val leftLine = left ?: return fallbackResult("left_boundary_not_found")
-            val rightLine = right ?: return fallbackResult("right_boundary_not_found")
-            val topLine = top ?: return fallbackResult("top_boundary_not_found")
-            val bottomLine = bottom ?: return fallbackResult("bottom_boundary_not_found")
-
-            val tl = intersect(leftLine, topLine, analysisWidth, analysisHeight)
-            val tr = intersect(rightLine, topLine, analysisWidth, analysisHeight)
-            val br = intersect(rightLine, bottomLine, analysisWidth, analysisHeight)
-            val bl = intersect(leftLine, bottomLine, analysisWidth, analysisHeight)
-            val geometry = CropGeometry(tl, tr, br, bl)
-
-            val minimumCoverage = min(
-                min(leftLine.coverage, rightLine.coverage),
-                min(topLine.coverage, bottomLine.coverage)
-            )
-            if (minimumCoverage < 0.055f) {
-                fallbackResult("insufficient_edge_coverage")
-            } else if (!isValidGeometry(geometry)) {
-                fallbackResult("invalid_detected_geometry")
-            } else {
-                val area = polygonArea(geometry)
-                val confidence = (minimumCoverage * 1.8f + area * 0.45f).coerceIn(0f, 1f)
-                AutoCropResult(geometry, confidence, usedFallback = false)
-            }
+            detectByRegion(luma, magnitudes, analysisWidth, analysisHeight)
+                ?: detectByEdgeLines(luma, gradientX, gradientY, magnitudes, analysisWidth, analysisHeight)
         } catch (_: OutOfMemoryError) {
             fallbackResult("analysis_out_of_memory")
         } catch (error: Exception) {
             fallbackResult("analysis_${error.javaClass.simpleName}")
         } finally {
             if (analysisBitmap !== bitmap && !analysisBitmap.isRecycled) analysisBitmap.recycle()
+        }
+    }
+
+    // ------------------------------------------------------------------------------------
+    // PRIMARY: whole-shape region segmentation + convex hull corner extraction.
+    // ------------------------------------------------------------------------------------
+
+    private fun detectByRegion(luma: FloatArray, magnitudes: FloatArray, width: Int, height: Int): AutoCropResult? {
+        if (width < 16 || height < 16) return null
+
+        val threshold = otsuThreshold(luma)
+        val centerIndex = (height / 2) * width + (width / 2)
+        val centerIsDocumentClass = luma[centerIndex] > threshold
+
+        var mask = BooleanArray(luma.size) { index -> (luma[index] > threshold) == centerIsDocumentClass }
+        mask = dilateHorizontal(mask, width, height, MORPH_CLOSE_RADIUS)
+        mask = dilateVertical(mask, width, height, MORPH_CLOSE_RADIUS)
+        mask = erodeHorizontal(mask, width, height, MORPH_CLOSE_RADIUS)
+        mask = erodeVertical(mask, width, height, MORPH_CLOSE_RADIUS)
+
+        val totalPixels = width * height
+        val (boundary, componentSize) = largestComponentBoundary(mask, width, height) ?: return null
+
+        val coverageFraction = componentSize.toFloat() / totalPixels
+        if (coverageFraction < MIN_REGION_COVERAGE || coverageFraction > MAX_REGION_COVERAGE) return null
+        if (boundary.size < 4) return null
+
+        val hull = convexHull(boundary)
+        if (hull.size < 4) return null
+
+        val tl = hull.minByOrNull { it.x + it.y } ?: return null
+        val br = hull.maxByOrNull { it.x + it.y } ?: return null
+        val tr = hull.maxByOrNull { it.x - it.y } ?: return null
+        val bl = hull.minByOrNull { it.x - it.y } ?: return null
+
+        // [Audit — Refactor v2] Region segmentation alone can be fooled when a bright, unrelated
+        // background object (e.g. a light reflection on the desk) touches or bridges into the
+        // paper's mask, pulling one hull corner far outside the true document -- the mask is
+        // technically one connected shape, so area/fill-ratio checks alone don't catch it (the
+        // spurious area is still "real" mask, just the wrong object). Cross-check every candidate
+        // edge against the independent Sobel gradient map: a genuine paper edge is a sustained,
+        // visible intensity transition along its *entire* length, while a corner dragged toward
+        // an unrelated blob produces an edge that only partially follows a real transition.
+        val edgeThreshold = percentileThreshold(magnitudes, 0.70f).coerceAtLeast(10f)
+        val edgesSupported =
+            edgeIsSupported(tl, tr, magnitudes, width, height, edgeThreshold) &&
+                edgeIsSupported(tr, br, magnitudes, width, height, edgeThreshold) &&
+                edgeIsSupported(br, bl, magnitudes, width, height, edgeThreshold) &&
+                edgeIsSupported(bl, tl, magnitudes, width, height, edgeThreshold)
+        if (!edgesSupported) return null
+
+        val geometry = CropGeometry(
+            topLeft = Offset(
+                (tl.x.toFloat() / width).coerceIn(0.002f, 0.998f),
+                (tl.y.toFloat() / height).coerceIn(0.002f, 0.998f)
+            ),
+            topRight = Offset(
+                (tr.x.toFloat() / width).coerceIn(0.002f, 0.998f),
+                (tr.y.toFloat() / height).coerceIn(0.002f, 0.998f)
+            ),
+            bottomRight = Offset(
+                (br.x.toFloat() / width).coerceIn(0.002f, 0.998f),
+                (br.y.toFloat() / height).coerceIn(0.002f, 0.998f)
+            ),
+            bottomLeft = Offset(
+                (bl.x.toFloat() / width).coerceIn(0.002f, 0.998f),
+                (bl.y.toFloat() / height).coerceIn(0.002f, 0.998f)
+            )
+        )
+        if (!isValidGeometry(geometry)) return null
+
+        val quadAreaFraction = polygonArea(geometry)
+        val quadAreaPixels = quadAreaFraction * totalPixels
+        val fillRatio = if (quadAreaPixels > 1f) componentSize / quadAreaPixels else 0f
+        val tightness = (1f - abs(1f - fillRatio)).coerceIn(0f, 1f)
+        val confidence = (tightness * 0.65f + coverageFraction.coerceAtMost(0.6f) * 0.55f).coerceIn(0f, 1f)
+
+        return AutoCropResult(geometry, confidence, usedFallback = false)
+    }
+
+    private fun otsuThreshold(luma: FloatArray): Int {
+        val histogram = IntArray(256)
+        for (value in luma) {
+            histogram[value.roundToInt().coerceIn(0, 255)]++
+        }
+        val total = luma.size
+        if (total == 0) return 127
+
+        var sumAll = 0.0
+        for (level in 0 until 256) sumAll += level.toDouble() * histogram[level]
+
+        var sumBackground = 0.0
+        var weightBackground = 0
+        var bestVariance = -1.0
+        var bestThreshold = 127
+        for (level in 0 until 256) {
+            weightBackground += histogram[level]
+            if (weightBackground == 0) continue
+            val weightForeground = total - weightBackground
+            if (weightForeground == 0) break
+            sumBackground += level.toDouble() * histogram[level]
+            val meanBackground = sumBackground / weightBackground
+            val meanForeground = (sumAll - sumBackground) / weightForeground
+            val diff = meanBackground - meanForeground
+            val variance = weightBackground.toDouble() * weightForeground.toDouble() * diff * diff
+            if (variance > bestVariance) {
+                bestVariance = variance
+                bestThreshold = level
+            }
+        }
+        return bestThreshold
+    }
+
+    private fun dilateHorizontal(mask: BooleanArray, width: Int, height: Int, radius: Int): BooleanArray {
+        val out = BooleanArray(mask.size)
+        val prefix = IntArray(width + 1)
+        for (y in 0 until height) {
+            val rowStart = y * width
+            prefix[0] = 0
+            for (x in 0 until width) prefix[x + 1] = prefix[x] + if (mask[rowStart + x]) 1 else 0
+            for (x in 0 until width) {
+                val lo = max(0, x - radius)
+                val hi = min(width - 1, x + radius)
+                out[rowStart + x] = (prefix[hi + 1] - prefix[lo]) > 0
+            }
+        }
+        return out
+    }
+
+    private fun dilateVertical(mask: BooleanArray, width: Int, height: Int, radius: Int): BooleanArray {
+        val out = BooleanArray(mask.size)
+        val prefix = IntArray(height + 1)
+        for (x in 0 until width) {
+            prefix[0] = 0
+            for (y in 0 until height) prefix[y + 1] = prefix[y] + if (mask[y * width + x]) 1 else 0
+            for (y in 0 until height) {
+                val lo = max(0, y - radius)
+                val hi = min(height - 1, y + radius)
+                out[y * width + x] = (prefix[hi + 1] - prefix[lo]) > 0
+            }
+        }
+        return out
+    }
+
+    private fun erodeHorizontal(mask: BooleanArray, width: Int, height: Int, radius: Int): BooleanArray {
+        val out = BooleanArray(mask.size)
+        val prefix = IntArray(width + 1)
+        for (y in 0 until height) {
+            val rowStart = y * width
+            prefix[0] = 0
+            for (x in 0 until width) prefix[x + 1] = prefix[x] + if (mask[rowStart + x]) 1 else 0
+            for (x in 0 until width) {
+                val lo = max(0, x - radius)
+                val hi = min(width - 1, x + radius)
+                val windowSize = hi - lo + 1
+                out[rowStart + x] = (prefix[hi + 1] - prefix[lo]) == windowSize
+            }
+        }
+        return out
+    }
+
+    private fun erodeVertical(mask: BooleanArray, width: Int, height: Int, radius: Int): BooleanArray {
+        val out = BooleanArray(mask.size)
+        val prefix = IntArray(height + 1)
+        for (x in 0 until width) {
+            prefix[0] = 0
+            for (y in 0 until height) prefix[y + 1] = prefix[y] + if (mask[y * width + x]) 1 else 0
+            for (y in 0 until height) {
+                val lo = max(0, y - radius)
+                val hi = min(height - 1, y + radius)
+                val windowSize = hi - lo + 1
+                out[y * width + x] = (prefix[hi + 1] - prefix[lo]) == windowSize
+            }
+        }
+        return out
+    }
+
+    /**
+     * Flood-fills the mask to find its largest 4-connected component, then returns that
+     * component's boundary pixels (any member pixel touching a non-member pixel or the frame
+     * edge) together with the component's total pixel count.
+     */
+    private fun largestComponentBoundary(
+        mask: BooleanArray,
+        width: Int,
+        height: Int
+    ): Pair<List<IntPoint>, Int>? {
+        val visited = BooleanArray(mask.size)
+        val queue = IntArray(mask.size)
+        var bestMembers: IntArray? = null
+        var bestSize = 0
+
+        for (start in mask.indices) {
+            if (!mask[start] || visited[start]) continue
+            var head = 0
+            var tail = 0
+            queue[tail++] = start
+            visited[start] = true
+            val members = ArrayList<Int>()
+            while (head < tail) {
+                val index = queue[head++]
+                members.add(index)
+                val x = index % width
+                val y = index / width
+                if (x > 0) {
+                    val neighbor = index - 1
+                    if (mask[neighbor] && !visited[neighbor]) { visited[neighbor] = true; queue[tail++] = neighbor }
+                }
+                if (x < width - 1) {
+                    val neighbor = index + 1
+                    if (mask[neighbor] && !visited[neighbor]) { visited[neighbor] = true; queue[tail++] = neighbor }
+                }
+                if (y > 0) {
+                    val neighbor = index - width
+                    if (mask[neighbor] && !visited[neighbor]) { visited[neighbor] = true; queue[tail++] = neighbor }
+                }
+                if (y < height - 1) {
+                    val neighbor = index + width
+                    if (mask[neighbor] && !visited[neighbor]) { visited[neighbor] = true; queue[tail++] = neighbor }
+                }
+            }
+            if (members.size > bestSize) {
+                bestSize = members.size
+                bestMembers = members.toIntArray()
+            }
+        }
+
+        val members = bestMembers ?: return null
+        val boundary = ArrayList<IntPoint>()
+        for (index in members) {
+            val x = index % width
+            val y = index / width
+            val isBoundary = x == 0 || y == 0 || x == width - 1 || y == height - 1 ||
+                !mask[index - 1] || !mask[index + 1] || !mask[index - width] || !mask[index + width]
+            if (isBoundary) boundary.add(IntPoint(x, y))
+        }
+        return boundary to bestSize
+    }
+
+    /** Standard Andrew's monotone chain convex hull, O(n log n). */
+    private fun convexHull(points: List<IntPoint>): List<IntPoint> {
+        val sorted = points.distinct().sortedWith(compareBy({ it.x }, { it.y }))
+        if (sorted.size < 3) return sorted
+
+        fun cross(o: IntPoint, a: IntPoint, b: IntPoint): Long =
+            (a.x - o.x).toLong() * (b.y - o.y) - (a.y - o.y).toLong() * (b.x - o.x)
+
+        val lower = ArrayList<IntPoint>()
+        for (point in sorted) {
+            while (lower.size >= 2 && cross(lower[lower.size - 2], lower[lower.size - 1], point) <= 0) {
+                lower.removeAt(lower.size - 1)
+            }
+            lower.add(point)
+        }
+        val upper = ArrayList<IntPoint>()
+        for (point in sorted.asReversed()) {
+            while (upper.size >= 2 && cross(upper[upper.size - 2], upper[upper.size - 1], point) <= 0) {
+                upper.removeAt(upper.size - 1)
+            }
+            upper.add(point)
+        }
+        lower.removeAt(lower.size - 1)
+        upper.removeAt(upper.size - 1)
+        return lower + upper
+    }
+
+    /**
+     * Samples points along the segment a->b and checks whether a real Sobel edge exists near
+     * each sample (a small neighborhood is checked to tolerate the +/-1px discretization of hull
+     * corners). Requires most of the segment to be backed by a real intensity transition.
+     */
+    private fun edgeIsSupported(
+        a: IntPoint,
+        b: IntPoint,
+        magnitudes: FloatArray,
+        width: Int,
+        height: Int,
+        edgeThreshold: Float,
+        neighborhoodRadius: Int = 2,
+        minSupportedFraction: Float = 0.75f
+    ): Boolean {
+        val steps = 24
+        var supported = 0
+        var sampled = 0
+        for (step in 1 until steps) {
+            val t = step / steps.toFloat()
+            val x = (a.x + (b.x - a.x) * t).roundToInt()
+            val y = (a.y + (b.y - a.y) * t).roundToInt()
+            var localMax = 0f
+            for (dy in -neighborhoodRadius..neighborhoodRadius) {
+                val ny = y + dy
+                if (ny !in 0 until height) continue
+                for (dx in -neighborhoodRadius..neighborhoodRadius) {
+                    val nx = x + dx
+                    if (nx !in 0 until width) continue
+                    val value = magnitudes[ny * width + nx]
+                    if (value > localMax) localMax = value
+                }
+            }
+            sampled++
+            if (localMax >= edgeThreshold) supported++
+        }
+        return sampled == 0 || (supported.toFloat() / sampled) >= minSupportedFraction
+    }
+
+    // ------------------------------------------------------------------------------------
+    // SECONDARY (fallback): legacy four-independent-boundary-lines search. Unchanged logic --
+    // kept only for frames where the document and its background are too close in brightness
+    // for [detectByRegion] to isolate a single confident connected shape.
+    // ------------------------------------------------------------------------------------
+
+    private fun detectByEdgeLines(
+        luma: FloatArray,
+        gradientX: FloatArray,
+        gradientY: FloatArray,
+        magnitudes: FloatArray,
+        width: Int,
+        height: Int
+    ): AutoCropResult {
+        val edgeThreshold = percentileThreshold(magnitudes, 0.78f).coerceAtLeast(14f)
+
+        val left = findVerticalBoundary(
+            luma, gradientX, gradientY, width, height,
+            minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
+            preferOuter = true, threshold = edgeThreshold
+        )
+        val right = findVerticalBoundary(
+            luma, gradientX, gradientY, width, height,
+            minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
+            preferOuter = false, threshold = edgeThreshold
+        )
+        val top = findHorizontalBoundary(
+            luma, gradientX, gradientY, width, height,
+            minBaseFraction = 0.01f, maxBaseFraction = 0.46f,
+            preferOuter = true, threshold = edgeThreshold
+        )
+        val bottom = findHorizontalBoundary(
+            luma, gradientX, gradientY, width, height,
+            minBaseFraction = 0.54f, maxBaseFraction = 0.99f,
+            preferOuter = false, threshold = edgeThreshold
+        )
+
+        val leftLine = left ?: return fallbackResult("left_boundary_not_found")
+        val rightLine = right ?: return fallbackResult("right_boundary_not_found")
+        val topLine = top ?: return fallbackResult("top_boundary_not_found")
+        val bottomLine = bottom ?: return fallbackResult("bottom_boundary_not_found")
+
+        val tl = intersect(leftLine, topLine, width, height)
+        val tr = intersect(rightLine, topLine, width, height)
+        val br = intersect(rightLine, bottomLine, width, height)
+        val bl = intersect(leftLine, bottomLine, width, height)
+        val geometry = CropGeometry(tl, tr, br, bl)
+
+        val minimumCoverage = min(
+            min(leftLine.coverage, rightLine.coverage),
+            min(topLine.coverage, bottomLine.coverage)
+        )
+        return if (minimumCoverage < 0.055f) {
+            fallbackResult("insufficient_edge_coverage")
+        } else if (!isValidGeometry(geometry)) {
+            fallbackResult("invalid_detected_geometry")
+        } else {
+            val area = polygonArea(geometry)
+            val confidence = (minimumCoverage * 1.8f + area * 0.45f).coerceIn(0f, 1f)
+            AutoCropResult(geometry, confidence, usedFallback = false)
         }
     }
 
@@ -209,8 +562,6 @@ object AutoCropDetector {
         val minBase = (width * minBaseFraction).roundToInt()
         val maxBase = (width * maxBaseFraction).roundToInt()
         val middleY = (height - 1) / 2f
-        // [Audit] Jarak sampel sisi dalam/luar untuk cek asimetri kecerahan, lihat dokumentasi
-        // di findHorizontalBoundary (logika identik, hanya sumbunya ditukar).
         val sideOffset = (width * 0.045f).roundToInt().coerceIn(3, 24)
         val innerSign = if (preferOuter) 1 else -1
         var best: LineModel? = null
@@ -248,7 +599,7 @@ object AutoCropDetector {
                 val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
                 val brightnessFactor = brightnessBiasFactor(innerLumaSum, outerLumaSum, sideSamples)
                 val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior * brightnessFactor
-                if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
+                if (best == null || score > best!!.score) best = LineModel(slope, base.toFloat(), score, coverage)
             }
             slope += 0.05f
         }
@@ -306,43 +657,18 @@ object AutoCropDetector {
                 val positionPrior = if (preferOuter) 1.12f - position * 0.28f else 0.84f + position * 0.28f
                 val brightnessFactor = brightnessBiasFactor(innerLumaSum, outerLumaSum, sideSamples)
                 val score = (sum / valid) * (0.55f + coverage * 1.9f) * positionPrior * brightnessFactor
-                if (best == null || score > best.score) best = LineModel(slope, base.toFloat(), score, coverage)
+                if (best == null || score > best!!.score) best = LineModel(slope, base.toFloat(), score, coverage)
             }
             slope += 0.05f
         }
         return best
     }
 
-    /**
-     * [Audit — Tahap Refactor] Root cause pemotongan halaman yang tidak akurat/miring
-     * (dilaporkan pengguna lewat rekaman video, dibandingkan dengan CamScanner): 4 sisi
-     * dicari SEPENUHNYA independen satu sama lain, dan skornya sebelumnya HANYA berbasis
-     * kekuatan gradien + cakupan garis. Di dokumen dengan garis tabel/formulir internal yang
-     * panjang dan lurus (kontras tinta-hitam-di-atas-kertas-putih bisa SAMA KUAT atau lebih
-     * kuat dari kontras tepi-kertas-vs-latar, apalagi kalau latar belakang foto gelap/kurang
-     * cahaya seperti pada video pengujian), garis tabel internal itu bisa MENGALAHKAN tepi
-     * kertas asli dalam skor — persis yang terlihat: sudut kanan-bawah hasil deteksi berhenti
-     * di garis pembatas tabel "ISI DISPOSISI", bukan di tepi kertas sesungguhnya.
-     *
-     * Pembeda kunci yang selama ini tidak dipakai: tepi kertas sungguhan punya lompatan
-     * kecerahan SATU ARAH (sisi dalam = kertas putih terang, sisi luar = latar belakang
-     * biasanya lebih gelap/bertekstur). Garis tabel internal TIDAK punya pola ini — kedua
-     * sisinya sama-sama kertas putih (kecerahan hampir sama, selisih mendekati nol).
-     *
-     * Fungsi ini memberi bobot skor berdasarkan pola itu: dukungan penuh (x1.0) kalau sisi
-     * dalam jelas lebih terang dari sisi luar, diturunkan bertahap sampai minimum x0.35 kalau
-     * polanya terbalik/tidak ada — sengaja tidak menolak total (bukan hard filter) supaya
-     * dokumen dengan latar belakang terang (mis. discan di atas meja putih) masih bisa
-     * terdeteksi lewat sinyal gradien seperti sebelumnya, hanya kalah prioritas dibanding
-     * kandidat lain yang polanya lebih meyakinkan.
-     */
     private fun brightnessBiasFactor(innerLumaSum: Float, outerLumaSum: Float, sideSamples: Int): Float {
         if (sideSamples == 0) return 0.5f
         val diff = (innerLumaSum - outerLumaSum) / sideSamples
         return ((diff.coerceIn(-40f, 60f) + 40f) / 100f) * 0.65f + 0.35f
     }
-
-
 
     /** Vertical line: x = a*y+b. Horizontal line: y = c*x+d. */
     private fun intersect(vertical: LineModel, horizontal: LineModel, width: Int, height: Int): Offset {
