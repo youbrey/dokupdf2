@@ -190,8 +190,16 @@ object FilterProcessor {
             }
         }
 
-        // Apply high-pass sharpening on text pixels to enhance small character legibility
-        applyUnsharpSharpen(outPixels, width, height, strength = 0.5f)
+        // [Audit — Refactor v2] applyMagicColor is the actual "CamScanner Ajaib Pro" doc-comment
+        // target above, and is also the function the AUTO dispatcher routes to for any document
+        // with noticeable color content (chroma >= 16 -- true for most real scans, which usually
+        // have at least a blue pen signature, stamp, or colored letterhead). It was still using a
+        // single unsharp pass while applySuperSharpen ("Mempertajam") had already been upgraded to
+        // a two-radius pass -- so the single most common real-world path (a colorful document run
+        // through the default "Otomatis" filter) was the one path that DIDN'T get that sharpness
+        // fix. Match the same proven dual-pass approach here.
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.55f, radius = 1)
+        applyUnsharpSharpen(outPixels, width, height, strength = 0.5f, radius = 3)
 
         val output = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         output.setPixels(outPixels, 0, width, 0, 0, width, height)
