@@ -63,6 +63,87 @@ class AutoCropAndFilterTest {
   }
 
   @Test
+  fun `auto crop handles rotated document with dense internal table lines`() {
+    // Regression test for the reported bug: a real scanned form has many internal ruled table
+    // lines whose ink-vs-paper contrast can rival the true paper-vs-background contrast. The
+    // previous per-side independent line search would sometimes lock onto one of these internal
+    // lines instead of the true outer edge, especially when the document was photographed at a
+    // visible rotation -- exactly what was reported via a side-by-side video comparison against
+    // CamScanner (the app fell back to a plain centered rectangle instead of the true, rotated
+    // quadrilateral). This synthesizes that scenario: a rotated form full of horizontal and
+    // vertical ruled lines, sitting on a dark background.
+    val width = 640
+    val height = 900
+    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    canvas.drawColor(Color.rgb(55, 58, 62))
+
+    val angleDegrees = 9f
+    val cx = width / 2f
+    val cy = height / 2f
+    val paperWidth = 400f
+    val paperHeight = 620f
+    val left = cx - paperWidth / 2f
+    val top = cy - paperHeight / 2f
+    val right = cx + paperWidth / 2f
+    val bottom = cy + paperHeight / 2f
+
+    canvas.save()
+    canvas.rotate(angleDegrees, cx, cy)
+    canvas.drawRect(left, top, right, bottom, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(235, 235, 235) })
+
+    val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+      color = Color.rgb(90, 90, 90)
+      strokeWidth = 2f
+    }
+    var rowY = top + 40f
+    while (rowY < bottom - 20f) {
+      canvas.drawLine(left + 10f, rowY, right - 10f, rowY, linePaint)
+      rowY += 38f
+    }
+    var colX = left + paperWidth / 4f
+    while (colX < right - 10f) {
+      canvas.drawLine(colX, top + 10f, colX, bottom - 10f, linePaint)
+      colX += paperWidth / 4f
+    }
+    canvas.restore()
+
+    fun rotatedNormalized(x: Float, y: Float): Offset {
+      val angleRad = Math.toRadians(angleDegrees.toDouble())
+      val dx = (x - cx).toDouble()
+      val dy = (y - cy).toDouble()
+      val rx = dx * Math.cos(angleRad) - dy * Math.sin(angleRad)
+      val ry = dx * Math.sin(angleRad) + dy * Math.cos(angleRad)
+      return Offset(((cx + rx) / width).toFloat(), ((cy + ry) / height).toFloat())
+    }
+    val expectedTl = rotatedNormalized(left, top)
+    val expectedTr = rotatedNormalized(right, top)
+    val expectedBr = rotatedNormalized(right, bottom)
+    val expectedBl = rotatedNormalized(left, bottom)
+
+    try {
+      val result = AutoCropDetector.detect(bitmap)
+      val diagnostic =
+        "reason=${result.failureReason}, confidence=${result.confidence}, geometry=${result.geometry}"
+
+      assertFalse(
+        "Dokumen berputar dengan garis tabel internal seharusnya tetap terdeteksi tanpa fallback: $diagnostic",
+        result.usedFallback
+      )
+      assertTrue("Geometri tidak valid: $diagnostic", AutoCropDetector.isValidGeometry(result.geometry))
+
+      fun dist(a: Offset, b: Offset) = kotlin.math.hypot((a.x - b.x).toDouble(), (a.y - b.y).toDouble())
+      val maxAllowedError = 0.03
+      assertTrue("Sudut kiri-atas meleset jauh: $diagnostic", dist(result.geometry.topLeft, expectedTl) < maxAllowedError)
+      assertTrue("Sudut kanan-atas meleset jauh: $diagnostic", dist(result.geometry.topRight, expectedTr) < maxAllowedError)
+      assertTrue("Sudut kanan-bawah meleset jauh: $diagnostic", dist(result.geometry.bottomRight, expectedBr) < maxAllowedError)
+      assertTrue("Sudut kiri-bawah meleset jauh: $diagnostic", dist(result.geometry.bottomLeft, expectedBl) < maxAllowedError)
+    } finally {
+      bitmap.recycle()
+    }
+  }
+
+  @Test
   fun `auto crop reports a deterministic fallback for a flat image`() {
     val bitmap = Bitmap.createBitmap(480, 640, Bitmap.Config.ARGB_8888).apply {
       eraseColor(Color.rgb(120, 120, 120))
